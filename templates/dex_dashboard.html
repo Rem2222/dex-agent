@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dex Control Center</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --card: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --dim: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --red: #f85149;
+    --orange: #d29922;
+    --purple: #bc8cff;
+    --cyan: #39d2c0;
+    --font: 'SF Mono','Cascadia Code','DejaVu Sans Mono',monospace;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 var(--font);
+    padding: 20px;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+  a { color: var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+
+  /* Header */
+  .header {
+    display:flex; align-items:center; gap:20px; flex-wrap:wrap;
+    padding:16px 20px; background:var(--card); border:1px solid var(--border);
+    border-radius:8px; margin-bottom:16px;
+  }
+  .header h1 { font-size:20px; font-weight:600; }
+  .status-led {
+    display:inline-block; width:12px; height:12px; border-radius:50%;
+    margin-right:6px;
+  }
+  .led-green { background:var(--green); box-shadow:0 0 8px var(--green); }
+  .led-red { background:var(--red); box-shadow:0 0 8px var(--red); }
+  .led-yellow { background:var(--orange); box-shadow:0 0 8px var(--orange); }
+
+  .badge {
+    display:inline-block; padding:2px 10px; border-radius:12px;
+    font-size:11px; font-weight:500;
+  }
+  .badge-green { background:#0c3d26; color:var(--green); border:1px solid var(--green); }
+  .badge-red { background:#3d1414; color:var(--red); border:1px solid var(--red); }
+  .badge-dim { background:#1c2128; color:var(--dim); border:1px solid var(--border); }
+
+  /* Grid */
+  .grid {
+    display:grid; grid-template-columns:1fr 1fr;
+    gap:12px; margin-bottom:12px;
+  }
+  @media (max-width:800px) { .grid { grid-template-columns:1fr; } }
+
+  .card {
+    background:var(--card); border:1px solid var(--border);
+    border-radius:8px; padding:16px;
+  }
+  .card-title {
+    font-size:11px; text-transform:uppercase; letter-spacing:1px;
+    color:var(--dim); margin-bottom:12px;
+  }
+  .card-actions {
+    display:flex; gap:6px; flex-wrap:wrap; margin-top:10px;
+  }
+  .card.full { grid-column:1/-1; }
+
+  /* Bars */
+  .bar-wrap { margin:6px 0; }
+  .bar-label { display:flex; justify-content:space-between; font-size:12px; margin-bottom:2px; }
+  .bar {
+    height:8px; background:#1c2128; border-radius:4px; overflow:hidden;
+  }
+  .bar-fill {
+    height:100%; border-radius:4px; transition:width 0.5s;
+  }
+  .bar-cyan { background:var(--cyan); }
+  .bar-purple { background:var(--purple); }
+
+  /* Table */
+  .tbl { width:100%; border-collapse:collapse; font-size:12px; }
+  .tbl th { text-align:left; color:var(--dim); padding:4px 8px; border-bottom:1px solid var(--border); }
+  .tbl td { padding:4px 8px; border-bottom:1px solid var(--border); vertical-align:top; }
+  .tbl tr:hover td { background:#1c2128; }
+
+  /* Code / LLM */
+  .llm-block {
+    background:#0d1117; border:1px solid var(--border); border-radius:6px;
+    padding:10px; margin:6px 0; font-size:11px; overflow-x:auto;
+    white-space:pre-wrap; word-break:break-word;
+  }
+  .llm-meta { color:var(--dim); font-size:11px; margin-bottom:6px; }
+
+  /* Accordion */
+  .accordion-toggle {
+    cursor:pointer; user-select:none;
+  }
+  .accordion-toggle:hover { color:var(--accent); }
+  .accordion-body { display:none; margin-top:6px; }
+
+  /* Buttons */
+  .btn {
+    display:inline-flex; align-items:center; gap:4px;
+    padding:5px 12px; border-radius:6px; border:1px solid var(--border);
+    background:var(--card); color:var(--text); font:12px var(--font);
+    cursor:pointer; transition:0.15s;
+  }
+  .btn:hover { background:#1c2128; border-color:var(--accent); }
+  .btn:active { transform:scale(0.97); }
+  .btn-danger { border-color:var(--red); color:var(--red); }
+  .btn-danger:hover { background:#3d1414; }
+  .btn-green { border-color:var(--green); color:var(--green); }
+  .btn-green:hover { background:#0c3d26; }
+  .btn-prime { border-color:var(--accent); color:var(--accent); }
+  .btn-prime:hover { background:#0c2d6b; }
+  .btn:disabled { opacity:0.4; cursor:not-allowed; }
+
+  .btn-icon { font-size:14px; }
+
+  /* Toast */
+  .toast {
+    position:fixed; bottom:20px; right:20px;
+    padding:10px 18px; border-radius:8px; font-size:13px;
+    background:var(--card); border:1px solid var(--border);
+    box-shadow:0 8px 24px rgba(0,0,0,0.4);
+    opacity:0; transition:opacity 0.3s; pointer-events:none;
+    z-index:100;
+  }
+  .toast.show { opacity:1; }
+  .toast.ok { border-color:var(--green); }
+  .toast.err { border-color:var(--red); }
+
+  /* Slider */
+  input[type=range] {
+    width:100%; height:4px; -webkit-appearance:none;
+    background:var(--border); border-radius:2px; outline:none;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance:none; width:14px; height:14px;
+    border-radius:50%; background:var(--accent); cursor:pointer;
+  }
+
+  .inline-flex { display:inline-flex; align-items:center; gap:8px; }
+
+  /* mini sparkline */
+  .spark { display:flex; align-items:flex-end; gap:2px; height:30px; margin:6px 0; }
+  .spark-bar { width:8px; border-radius:2px 2px 0 0; min-height:2px; transition:height 0.3s; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>⚡&thinsp;Dex Control Center</h1>
+  <span id="led-status"><span class="status-led led-yellow"></span>загрузка…</span>
+  <span class="badge badge-dim" id="tick-badge">тик —</span>
+  <span style="flex:1"></span>
+  <span style="font-size:11px;color:var(--dim)" id="last-updated"></span>
+</div>
+
+<div class="grid">
+  <!-- Drives -->
+  <div class="card">
+    <div class="card-title">🧠 Drives</div>
+    <div class="bar-wrap">
+      <div class="bar-label"><span>Любопытство</span><span id="curiosity-val">0.5</span></div>
+      <div class="bar"><div class="bar-fill bar-cyan" id="curiosity-bar" style="width:50%"></div></div>
+    </div>
+    <div class="bar-wrap">
+      <div class="bar-label"><span>Исполнительность</span><span id="diligence-val">0.5</span></div>
+      <div class="bar"><div class="bar-fill bar-purple" id="diligence-bar" style="width:50%"></div></div>
+    </div>
+    <div class="card-actions">
+      <span class="inline-flex" style="font-size:11px">
+        🧠 <input type="range" id="slider-curiosity" min="0" max="1" step="0.05" value="0.5" oninput="onDriveChange()">
+      </span>
+      <span class="inline-flex" style="font-size:11px">
+        💪 <input type="range" id="slider-diligence" min="0" max="1" step="0.05" value="0.5" oninput="onDriveChange()">
+      </span>
+      <button class="btn btn-prime" onclick="setDrives()">Применить</button>
+    </div>
+  </div>
+
+  <!-- Focus + Config -->
+  <div class="card">
+    <div class="card-title">🎯 Состояние</div>
+    <div style="font-size:12px;display:grid;grid-template-columns:auto 1fr;gap:4px 12px">
+      <span style="color:var(--dim)">Фокус:</span><span id="focus-val">—</span>
+      <span style="color:var(--dim)">Последнее действие:</span><span id="last-action">—</span>
+      <span style="color:var(--dim)">Результат:</span><span id="last-result" style="word-break:break-word">—</span>
+      <span style="color:var(--dim)">DISABLED:</span><span id="disabled-val">—</span>
+    </div>
+    <div class="card-actions">
+      <input type="text" id="focus-input" placeholder="новый фокус…" style="flex:1;background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text);font:12px var(--font)">
+      <button class="btn btn-prime" onclick="setFocus()">Установить фокус</button>
+    </div>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- Poller -->
+  <div class="card">
+    <div class="card-title">📡 Poller</div>
+    <div style="font-size:12px;display:grid;grid-template-columns:auto 1fr;gap:4px 12px">
+      <span style="color:var(--dim)">Статус:</span><span id="poller-status">—</span>
+      <span style="color:var(--dim)">PID:</span><span id="poller-pid">—</span>
+      <span style="color:var(--dim)">С какого:</span><span id="poller-since">—</span>
+    </div>
+    <div class="card-actions">
+      <button class="btn btn-green" onclick="action('poller-restart')">⟳ Перезапустить poller</button>
+    </div>
+  </div>
+
+  <!-- System DB -->
+  <div class="card">
+    <div class="card-title">💾 Базы данных</div>
+    <div style="font-size:12px" id="db-stats">загрузка…</div>
+    <div class="card-actions">
+      <button class="btn" onclick="action('tick')">▶ Принудительный heartbeat</button>
+      <button class="btn btn-danger" onclick="action('disable',{minutes:30})">⏸ Спать 30м</button>
+      <button class="btn btn-green" onclick="action('enable')">▶ Включить</button>
+    </div>
+  </div>
+</div>
+
+<!-- LLM Inspector -->
+<div class="card full" id="llm-section">
+  <div class="card-title accordion-toggle" onclick="toggleAccordion('llm-body')">🤖 LLM Trace ▾</div>
+  <div class="accordion-body" id="llm-body"></div>
+</div>
+
+<!-- Sessions -->
+<div class="card full">
+  <div class="card-title accordion-toggle" onclick="toggleAccordion('sessions-body')">💬 Диалоги (sessions.db) ▾</div>
+  <div class="accordion-body" id="sessions-body"></div>
+</div>
+
+<!-- Ticks -->
+<div class="card full">
+  <div class="card-title accordion-toggle" onclick="toggleAccordion('ticks-body')">📋 История тиков ▾</div>
+  <div class="accordion-body" id="ticks-body"></div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script>
+let state = {};
+const ACC = {};
+const API_BASE = location.pathname.replace(/\/+$/, '');
+
+function toggleAccordion(id) {
+  const el = document.getElementById(id);
+  ACC[id] = !(ACC[id] ?? false);
+  el.style.display = ACC[id] ? 'block' : 'none';
+}
+
+function toast(msg, ok=true) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show ' + (ok ? 'ok' : 'err');
+  setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+async function api(method, path, body) {
+  try {
+    const opts = { method, headers: {'Content-Type':'application/json'} };
+    if (body) opts.body = JSON.stringify(body);
+    const r = await fetch(path, opts);
+    return await r.json();
+  } catch(e) {
+    toast('Ошибка: '+e.message, false);
+    return {error: e.message};
+  }
+}
+
+async function loadStatus() {
+  const data = await api('GET', API_BASE + '/api/status');
+  if (data.error) { toast(data.error, false); return; }
+  state = data;
+
+  // LED
+  const led = document.getElementById('led-status');
+  if (data.disabled) led.innerHTML = '<span class="status-led led-yellow"></span>🟡 Спит (DISABLED)';
+  else if (data.alive) led.innerHTML = '<span class="status-led led-green"></span>🟢 Жив';
+  else led.innerHTML = '<span class="status-led led-red"></span>🔴 Мёртв';
+
+  document.getElementById('tick-badge').textContent = 'тик #' + (data.tick_count ?? '?');
+  document.getElementById('last-updated').textContent = 'обновлено ' + (data.updated_at ? data.updated_at.slice(11,19) : '?');
+
+  // Drives
+  const d = data.drives || {};
+  const cur = Math.round((d.curiosity||0.5)*100);
+  const dil = Math.round((d.diligence||0.5)*100);
+  document.getElementById('curiosity-val').textContent = (d.curiosity||0.5).toFixed(2);
+  document.getElementById('curiosity-bar').style.width = cur+'%';
+  document.getElementById('diligence-val').textContent = (d.diligence||0.5).toFixed(2);
+  document.getElementById('diligence-bar').style.width = dil+'%';
+
+  // Focus
+  document.getElementById('focus-val').textContent = data.focus || '—';
+  document.getElementById('disabled-val').textContent = data.disabled ? '✅ (флаг есть)' : '—';
+
+  // Last tick
+  const lt = data.last_tick;
+  if (lt) {
+    document.getElementById('last-action').textContent = lt.action || '—';
+    document.getElementById('last-result').textContent = lt.result || '—';
+  }
+
+  // Poller
+  const p = data.poller || {};
+  document.getElementById('poller-status').innerHTML = p.active
+    ? '<span class="badge badge-green">● active</span>'
+    : '<span class="badge badge-red">● inactive</span>';
+  document.getElementById('poller-pid').textContent = p.pid || '—';
+  document.getElementById('poller-since').textContent = p.since ? p.since.slice(11,25) : '—';
+
+  // DB stats
+  const dbs = data.db_stats || {};
+  document.getElementById('db-stats').innerHTML = Object.entries(dbs).map(([k,v]) =>
+    `<div style="display:flex;justify-content:space-between;padding:2px 0;border-bottom:1px solid var(--border)">
+      <span style="color:var(--dim)">${k}</span>
+      <span>${v.size > 1024 ? (v.size/1024).toFixed(1)+' KB' : v.size+' B'}</span>
+    </div>`
+  ).join('');
+
+  // LLM log
+  renderLLM(data.llm_log || []);
+
+  // Sessions
+  renderSessions(data.sessions);
+
+  // Ticks
+  renderTicks(data.ticks || []);
+}
+
+function renderLLM(log) {
+  const el = document.getElementById('llm-body');
+  if (!log.length) { el.innerHTML = '<span style="color:var(--dim)">Нет записей</span>'; return; }
+  el.innerHTML = log.map(r => `
+    <div class="llm-meta">
+      <b>#${r.tick}</b> ${r.ts?.slice(11,19)} | ${r.latency_ms}ms | ${r.token_count||'?'} токенов
+    </div>
+    <div class="llm-block"><b>System:</b>\n${esc(r.system||'')}</div>
+    <div class="llm-block"><b>User:</b>\n${esc(r.prompt||'')}</div>
+    <div class="llm-block" style="border-left:3px solid var(--green)"><b>Response:</b>\n${esc(r.response||'—')}</div>
+  `).join('\n');
+}
+
+function renderSessions(sd) {
+  const el = document.getElementById('sessions-body');
+  if (!sd || !sd.sessions || !sd.sessions.length) {
+    el.innerHTML = '<span style="color:var(--dim)">Нет диалогов</span>';
+    return;
+  }
+  el.innerHTML = sd.sessions.map(ch => `
+    <div style="margin:8px 0;padding:8px;background:#0d1117;border-radius:6px;border:1px solid var(--border)">
+      <div style="font-size:11px;color:var(--dim);margin-bottom:4px">
+        Чат <b>${ch.chat_id}</b> · ${ch.count} сообщений · ${ch.first_ts?.slice(11,16)||'?'}–${ch.last_ts?.slice(11,16)||'?'}
+      </div>
+      ${ch.messages.map(m => `
+        <div style="font-size:12px;padding:2px 0">
+          <span style="color:${m.role==='user'?'var(--cyan)':'var(--purple)'}">${m.role}:</span>
+          ${esc(m.content)}
+          <span style="color:var(--dim);font-size:10px">${m.ts?.slice(11,19)}</span>
+        </div>
+      `).join('')}
+    </div>
+  `).join('');
+  // Кнопка очистки
+  el.innerHTML += '<button class="btn btn-danger" onclick="clearSessions()" style="margin-top:8px">🗑 Очистить диалоги</button>';
+}
+
+function renderTicks(ticks) {
+  const el = document.getElementById('ticks-body');
+  if (!ticks.length) { el.innerHTML = '<span style="color:var(--dim)">Нет тиков</span>'; return; }
+  el.innerHTML = `
+    <table class="tbl">
+      <tr><th>#</th><th>Действие</th><th>Результат</th><th>Время</th></tr>
+      ${ticks.slice().reverse().map(t => `
+        <tr>
+          <td style="color:var(--dim)">${t.tick||'?'}</td>
+          <td><span class="badge ${t.action==='none'?'badge-dim':'badge-green'}">${t.action||'?'}</span></td>
+          <td style="max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.result||'')}</td>
+          <td style="color:var(--dim)">${t.ts?.slice(11,19)||''}</td>
+        </tr>
+      `).join('')}
+    </table>`;
+}
+
+// ─── Actions ──────────────────────────────────────────────
+
+async function action(name, extra) {
+  const btn = event?.target;
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api('POST', API_BASE + '/api/action/'+name, extra || {});
+    if (r.ok) toast('✅ '+name+' выполнено');
+    else toast('❌ '+name+': '+(r.error||r.output||'?'), false);
+    loadStatus();
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function onDriveChange() {
+  const c = document.getElementById('slider-curiosity').value;
+  const d = document.getElementById('slider-diligence').value;
+  document.getElementById('curiosity-val').textContent = parseFloat(c).toFixed(2);
+  document.getElementById('curiosity-bar').style.width = (c*100)+'%';
+  document.getElementById('diligence-val').textContent = parseFloat(d).toFixed(2);
+  document.getElementById('diligence-bar').style.width = (d*100)+'%';
+}
+
+async function setDrives() {
+  const c = parseFloat(document.getElementById('slider-curiosity').value);
+  const d = parseFloat(document.getElementById('slider-diligence').value);
+  const r = await api('POST', API_BASE + '/api/action/set-drives', {curiosity:c, diligence:d});
+  if (r.ok) toast('✅ Drives обновлены');
+  else toast('❌ '+r.error, false);
+}
+
+async function setFocus() {
+  const inp = document.getElementById('focus-input');
+  const val = inp.value.trim();
+  if (!val) return;
+  const r = await api('POST', API_BASE + '/api/action/set-focus', {focus: val});
+  if (r.ok) { toast('✅ Фокус установлен'); inp.value=''; loadStatus(); }
+  else toast('❌ '+r.error, false);
+}
+
+async function clearSessions() {
+  const r = await api('POST', API_BASE + '/api/data/clear-sessions');
+  if (r.ok) { toast('✅ Диалоги очищены'); loadStatus(); }
+}
+
+// ─── Utils ────────────────────────────────────────────────
+
+function esc(s) {
+  if (!s) return '';
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// ─── Init ─────────────────────────────────────────────────
+loadStatus();
+setInterval(loadStatus, 15000);
+</script>
+</body>
+</html>

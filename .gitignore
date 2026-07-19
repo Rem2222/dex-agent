@@ -1,0 +1,17 @@
+# Dex Agent — .gitignore
+
+# Базы данных (меняются постоянно, бинарные)
+*.db
+*.db-shm
+*.db-wal
+tick_history.jsonl
+
+# Секреты
+.env
+.poller_offset
+
+# Системные
+DISABLED
+__pycache__/
+*.pyc
+.DS_Store
