@@ -26,6 +26,19 @@ ENV_PATH = BASE_DIR / ".env"
 DEX_BOT_TOKEN = None
 DEX_CHAT_ID = 386235337  # Rem — куда слать уведомления
 
+# === NOTIFICATION POLICY ===
+# В Telegram — только аномалии. Рутина копится в ежедневный дайджест.
+# Кулдаун на повтор того же сообщения (сек).
+NOTIFY_COOLDOWN_SECONDS = {
+    "check_services": 6 * 3600,
+    "check_backups": 6 * 3600,
+    "check_updates": 24 * 3600,
+    "check_disk": 6 * 3600,
+    "check_tools": 24 * 3600,
+}
+DIGEST_INTERVAL_SECONDS = 24 * 3600
+DIGEST_MAX_ENTRIES = 12
+
 def load_dex_token():
     """Загружает токен Dex бота из .env"""
     global DEX_BOT_TOKEN
@@ -303,41 +316,99 @@ def main():
     set_state(db, "drives", drives)
     write_tick({"tick": tick_num, "action": decision, "result": result[:200], "ts": datetime.now(timezone.utc).isoformat()})
 
-    # 8. Отправляем уведомление в Telegram (только если есть что сказать)
+    # 8. Отправляем уведомление в Telegram — только аномалии, с кулдауном
     notify = format_notification(decision, result)
     if notify:
-        send_telegram(notify)
+        if should_notify(db, decision, notify):
+            send_telegram(notify)
+            mark_notified(db, decision, notify)
+        else:
+            log(f"Telegram: {decision} — кулдаун, пропускаю (уже слали то же)")
+    else:
+        # Рутина — не в Telegram, а в ежедневный дайджест
+        add_digest_entry(db, decision, result)
+        maybe_send_digest(db)
+
+def should_notify(db, action, text):
+    """Кулдаун: не слать то же сообщение чаще раза в N часов."""
+    last = get_state(db, "last_notify", {})
+    entry = last.get(action)
+    cooldown = NOTIFY_COOLDOWN_SECONDS.get(action, 24 * 3600)
+    now = time.time()
+    if entry:
+        # То же самое сообщение в пределах кулдауна — не дублируем
+        if entry.get("text") == text and now - entry.get("ts", 0) < cooldown:
+            return False
+    return True
+
+def mark_notified(db, action, text):
+    last = get_state(db, "last_notify", {})
+    last[action] = {"ts": time.time(), "text": text}
+    set_state(db, "last_notify", last)
+
+def add_digest_entry(db, action, result):
+    if not result:
+        return
+    entries = get_state(db, "digest_entries", [])
+    # Дедуп: то же действие с тем же результатом не дублируем
+    for e in entries:
+        if e.get("action") == action and e.get("result") == result:
+            return
+    entries.append({"action": action, "result": result[:150], "ts": datetime.now(timezone.utc).isoformat()})
+    set_state(db, "digest_entries", entries[-DIGEST_MAX_ENTRIES:])
+
+def maybe_send_digest(db):
+    """Раз в сутки шлёт сводку рутинных результатов."""
+    last = get_state(db, "last_digest_sent", 0)
+    entries = get_state(db, "digest_entries", [])
+    if not entries:
+        return
+    if time.time() - last < DIGEST_INTERVAL_SECONDS:
+        return
+    lines = []
+    for e in entries[-DIGEST_MAX_ENTRIES:]:
+        ts = e.get("ts", "").replace("T", " ")[5:16]  # MM-DD HH:MM
+        lines.append(f"• {ts} {e.get('action','?')}: {e.get('result','')}")
+    text = "📊 <b>Dex — дайджест за сутки</b>\n" + "\n".join(lines)
+    ok = send_telegram(text)
+    if ok:
+        set_state(db, "last_digest_sent", time.time())
+        set_state(db, "digest_entries", [])
 
 def format_notification(action, result):
-    """Форматирует результат в уведомление для Telegram. Возвращает None если слать нечего."""
+    """Форматирует результат для Telegram. Возвращает None, если слать нечего.
+    Правило: в Telegram — только аномалии. Рутина уходит в дайджест."""
     if not result:
         return None
-    # Слишком частые уведомления о диске не шлём — только при проблемах
     if action == "check_disk":
+        # Шлём только если места мало (<=10G или <=10%)
         if "свободно" in result:
             parts = result.split()
             for i, p in enumerate(parts):
                 if p == "свободно" and i > 0:
                     free = parts[i-1].rstrip(',')
-                    # Если свободно > 10% — молчим
                     if free.endswith('G') and float(free[:-1]) > 10:
                         return None
                     if free.endswith('%') and float(free[:-1]) > 10:
                         return None
         return f"💾 <b>Диск</b>: {result}"
     if action == "check_backups":
-        return f"💿 <b>Бэкапы</b>: {result}"
+        # Аномалия: бэкапов нет или ошибка
+        if "нет файлов" in result or "не найдена" in result or "ошибка" in result:
+            return f"💿 <b>Бэкапы</b>: {result}"
+        return None
     if action == "check_updates":
-        if "актуальны" in result:
-            return None  # не шлем если всё хорошо
-        return f"📦 <b>Обновления</b>: {result}"
+        # Рутина — доступные обновления не аномалия, уходит в дайджест
+        return None
     if action == "check_tools":
         if "запланирован" in result:
             return None
         return f"🔧 <b>Инструменты</b>: {result}"
     if action == "check_services":
-        # Всегда шлём — сервисы важны
-        return f"🔍 <b>Сервисы</b>: {result}"
+        # Аномалия: сервис не active, контейнеров 0 или ошибка
+        if "inactive" in result or "failed" in result or "контейнеров: 0" in result or "ошибка" in result:
+            return f"🔍 <b>Сервисы</b>: {result}"
+        return None
     return None
 
 def execute_check_backups():
