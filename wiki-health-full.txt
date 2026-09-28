@@ -1,0 +1,69 @@
+Wiki Health Report (322 content pages)
+============================================================
+U+1F4C4 No frontmatter: `openviking-task-description.md`
+U+1F517 No related links: `tasks/zvec-mcp-and-wiki-write.md`
+U+1F517 No related links: `tasks/dsh-hindsight-plugin.md`
+U+1F517 No related links: `tasks/hindsight-memory-migration.md`
+U+26A0  Multiple H1s (2): `tech/ax.md`
+U+1F517 No related links: `tech/amneziawg-keenetic.md`
+U+1F517 No related links: `tech/needle-cactus.md`
+U+1F517 No related links: `tech/omarchy.md`
+U+1F4DD Missing description: `tools/tgrep.md`
+U+1F517 No related links: `tools/tgrep.md`
+U+1F4DD Missing description: `tools/cmu-agents.md`
+U+1F517 No related links: `tools/cmu-agents.md`
+U+1F517 No related links: `tools/1c-mcp-catalog.md`
+U+1F517 No related links: `tools/1c-ai-connector.md`
+U+1F4DD Missing description: `tools/wemm-embedding.md`
+U+1F4DD Missing description: `tools/browser-skill.md`
+U+1F517 No related links: `tools/browser-skill.md`
+U+1F4DD Missing description: `tools/unity-ai-agents-plugin.md`
+U+1F517 No related links: `tools/unity-ai-agents-plugin.md`
+U+1F517 No related links: `tools/codex-chatgpt-web.md`
+U+1F4DD Missing description: `tools/rdp-monster.md`
+U+1F4DD Missing description: `patterns/vibe-coding-memory-architecture.md`
+U+1F517 No related links: `patterns/vibe-coding-memory-architecture.md`
+U+1F4DD Missing description: `patterns/1c-multi-agent-development.md`
+U+1F517 No related links: `patterns/1c-multi-agent-development.md`
+U+1F4DD Missing description: `ops/services/openviking.md`
+U+1F517 No related links: `hermes/skills/hindsight-mental-models.SKILL.md`
+U+1F517 No related links: `hermes/skills/hindsight-migration-2026-08.md`
+U+1F517 No related links: `hermes/skills/hindsight-mm-tags-and-zvec-mcp-2026-08.md`
+U+1F3F7  Missing tags: `hermes/skills/memory-wiki-workflow.SKILL.md`
+U+1F517 No related links: `hermes/skills/memory-wiki-workflow.SKILL.md`
+U+1F517 No related links: `hermes/skills/state-db-hardline-rule.md`
+U+1F517 No related links: `hermes/skills/memory-management.SKILL.md`
+U+1F517 No related links: `hermes/skills/hindsight-verify-live-2026-08.md`
+
+U+1F517 BROKEN WIKILINKS (50):
+   X [[1c_mcp_project]] <- from patterns/1c-multi-agent-development.md
+   X [[articles/name]] <- from hermes/skills/memory-wiki-workflow.SKILL.md, hermes/skills/memory-wiki-workflow.SKILL.md
+   X [[bare]] <- from hermes/skills/memory-wiki-workflow.SKILL.md
+   X [[bare-name]] <- from hermes/skills/memory-wiki-workflow.SKILL.md
+   X [[books/name]] <- from hermes/skills/memory-wiki-workflow.SKILL.md, hermes/skills/memory-wiki-workflow.SKILL.md
+   X [[ccgs-ux-spec]] <- from tools/unity-ai-agents-plugin.md
+   X [[codegraph]] <- from tools/tgrep.md
+   X [[cognee]] <- from patterns/vibe-coding-memory-architecture.md, patterns/1c-multi-agent-development.md
+   X [[concepts/name]] <- from hermes/skills/memory-wiki-workflow.SKILL.md, hermes/skills/memory-wiki-workflow.SKILL.md
+   X [[deepseek_harness]] <- from tools/tgrep.md, patterns/1c-multi-agent-development.md
+   X [[events/name]] <- from hermes/skills/memory-wiki-workflow.SKILL.md, hermes/skills/memory-wiki-workflow.SKILL.md
+   X [[freellmapi-models-sync]] <- from tech/qwen38-27b-local-gpu.md
+   X [[hindsight]] <- from patterns/vibe-coding-memory-architecture.md
+   X [[link]] <- from hermes/skills/memory-wiki-workflow.SKILL.md
+   X [[misc/name]] <- from hermes/skills/memory-wiki-workflow.SKILL.md, hermes/skills/memory-wiki-workflow.SKILL.md
+   ... + 35 more
+
+U+1F47B ORPHAN PAGES (33):
+   U+1F47B openviking-task-description.md
+   U+1F47B tasks/zvec-mcp-and-wiki-write.md
+   U+1F47B tasks/dsh-hindsight-plugin.md
+   U+1F47B tech/sol-pi-nvidia.md
+   U+1F47B tech/trace-moe.md
+   U+1F47B tech/zvec-mcp-wiki-search.md
+   U+1F47B tech/amneziawg-keenetic.md
+   U+1F47B tech/ai-guardrails.md
+   U+1F47B tech/ternary-bonsai-2.md
+   U+1F47B tech/freetoken-edge-moe-serving-for-personal-hardware.md
+   ... + 23 more
+
+Summary: 63 issues found
