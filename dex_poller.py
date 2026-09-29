@@ -25,7 +25,32 @@ SESSIONS_DB = BASE_DIR / "sessions.db"
 POLL_INTERVAL = 3  # секунд между опросами
 DISABLED_FLAG = BASE_DIR / "DISABLED"
 
-GATEWAY_KEY = "123c867ed8cc504a5e602b4189cc201964a4e7331a20d7aeb883b88fdf86ed0a"
+
+def load_env_file():
+    """Подставляет KEY=VALUE из proactive/.env в os.environ (не перезаписывая).
+
+    Раньше LLM-вызов был захардкожен на Gateway (порт 8642) с литералом
+    'Bearer ***' — из-за этого приходил 401 и Dex отвечал «не смог
+    связаться с мозгом». Теперь провайдер/ключ/модель берутся из .env.
+    """
+    if not ENV_PATH.exists():
+        return
+    for line in ENV_PATH.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip())
+
+
+load_env_file()
+
+# === LLM-провайдер Dex ===
+# Дефолт — gemini-web2api (docker, 127.0.0.1:8083): бесплатный, живой,
+# не зависит от Gateway и от наличия API_SERVER_KEY.
+DEX_API_URL = os.environ.get("DEX_API_URL", "http://127.0.0.1:8083/v1/chat/completions")
+DEX_API_KEY = os.environ.get("DEX_API_KEY", "sk-gemini")
+DEX_MODEL = os.environ.get("DEX_MODEL", "gemini-3.5-flash")
 
 # === STATE ===
 bot_token = None
@@ -169,15 +194,21 @@ def process_message(msg_data):
     send_message(chat_id, response)
 
 def call_hermes(messages):
-    """Вызывает Hermes Gateway API"""
+    """Вызывает LLM-провайдера Dex (DEX_API_URL, см. .env).
+
+    Раньше был жёстко захардкожен Gateway (127.0.0.1:8642) + модель
+    deepseek-v4-flash. Ключ GATEWAY_KEY перестал действовать: секции
+    api_server в config.yaml нет, API_SERVER_KEY не задан → 401.
+    Теперь дефолт — gemini-web2api на 8083 (бесплатный, без Gateway).
+    """
     try:
         result = subprocess.run(
             ["curl", "-s", "-X", "POST",
-             "http://127.0.0.1:8642/v1/chat/completions",
+             DEX_API_URL,
              "-H", "Content-Type: application/json",
-             "-H", f"Authorization: Bearer {GATEWAY_KEY}",
+             "-H", "Authorization: Bearer " + DEX_API_KEY,
              "-d", json.dumps({
-                 "model": "deepseek-v4-flash",
+                 "model": DEX_MODEL,
                  "messages": messages,
                  "max_tokens": 1000,
                  "temperature": 0.7
