@@ -39,6 +39,23 @@ NOTIFY_COOLDOWN_SECONDS = {
 DIGEST_INTERVAL_SECONDS = 24 * 3600
 DIGEST_MAX_ENTRIES = 12
 
+# === Драйвы: дефицит копится, насыщение сбрасывает ===
+# Модель утверждена Романом 30.09: пока потребность не выполнена, уровень
+# РАСТЁТ, а выполнение действия её УДОВЛЕТВОРЯЕТ и уровень падает.
+# Раньше было ровно наоборот — драйв увеличивался ПОСЛЕ действия и никогда
+# не убывал, поэтому оба упёрлись в потолок 1.0 и стали константой.
+DRIVE_FLOOR = 0.10               # пол, чтобы не исчезал совсем
+DRIVE_CEIL = 1.00                # потолок
+DRIVE_STEP_IDLE = 0.10           # простой тик -> растёт любопытство
+DRIVE_STEP_OVERDUE = 0.05        # просроченная обязанность -> растёт исполнительность
+DRIVE_SAT_CURIOSITY = 0.40       # explore_interest -> сильное насыщение
+DRIVE_SAT_DILIGENCE = 0.30       # выполненная обязанность -> насыщение
+DRIVE_SAT_PARTIAL = 0.10         # любое другое действие -> частичное насыщение
+
+# Обязанности (совпадает с интервалами в check_duty)
+DUTY_KEYS = {"check_backups", "check_updates", "check_disk",
+             "check_tools", "check_services"}
+
 def load_dex_token():
     """Загружает токен Dex бота из .env"""
     global DEX_BOT_TOKEN
@@ -248,6 +265,21 @@ def check_duty(db, identity):
                 results.append(duty_key)
     return results
 
+def migrate_drives(db, drives):
+    """Разовый сброс драйвов под новую модель (v2).
+
+    Старая логика не имела убывания, поэтому curiosity и diligence давно
+    упёрлись в 1.0 — градиента не было с чего начать. Ставим середину
+    и помечаем миграцию, чтобы выполнить её ровно один раз.
+    """
+    if get_state(db, "drives_v2", False):
+        return drives
+    fresh = {"curiosity": 0.4, "diligence": 0.4}
+    set_state(db, "drives", fresh)
+    set_state(db, "drives_v2", True)
+    log(f"Драйвы мигрированы на модель v2: {drives} -> {fresh}")
+    return fresh
+
 # === MAIN ===
 def main():
     # 1. Красная кнопка
@@ -267,8 +299,14 @@ def main():
     # 3. Читаем историю и идентичность
     history = read_tick_history(3)
     focus = get_state(db, "current_focus", "nothing")
-    drives = get_state(db, "drives", {"curiosity": 0.5, "diligence": 0.5})
+    drives = migrate_drives(db, get_state(db, "drives", {"curiosity": 0.5, "diligence": 0.5}))
     duty_due = check_duty(db, identity)
+
+    # Дефицит: пока обязанность не сделана, исполнительность копится
+    if duty_due:
+        drives["diligence"] = round(min(DRIVE_CEIL,
+                                        drives.get("diligence", 0.5) + DRIVE_STEP_OVERDUE), 2)
+        set_state(db, "drives", drives)
 
     # 4. Собираем промпт для решения
     prompt_parts = [
@@ -277,6 +315,16 @@ def main():
         f"Уровень любопытства: {drives.get('curiosity', 0.5)}",
         f"Уровень исполнительности: {drives.get('diligence', 0.5)}",
     ]
+    # Драйвы должны ВЛИЯТЬ на выбор, а не быть декорацией: голые числа LLM
+    # не учитывает, поэтому при высоком уровне даём прямую подсказку.
+    if drives.get("curiosity", 0) >= 0.7:
+        prompt_parts.append(
+            f"Драйв любопытства высокий ({drives['curiosity']:.2f}) — "
+            "если ничего не срочно, выбери explore_interest.")
+    if drives.get("diligence", 0) >= 0.7:
+        prompt_parts.append(
+            f"Драйв исполнительности высокий ({drives['diligence']:.2f}) — "
+            "выбери одну из обязанностей в списке «Пора проверить».")
     if duty_due:
         prompt_parts.append(f"Пора проверить: {', '.join(duty_due)}")
     if history:
@@ -297,6 +345,10 @@ def main():
     if not decision or decision.strip() == "none":
         log("Dex решил ничего не делать в этом тике")
         set_state(db, "current_focus", "nothing")
+        # Простой: потребность не насыщена, уровень растёт
+        drives["curiosity"] = round(min(DRIVE_CEIL,
+                                        drives.get("curiosity", 0.5) + DRIVE_STEP_IDLE), 2)
+        set_state(db, "drives", drives)
         write_tick({"tick": tick_num, "action": "none", "result": "ok", "ts": datetime.now(timezone.utc).isoformat()})
         return
 
@@ -333,9 +385,16 @@ def main():
     # 7. Логируем результат
     log(f"Результат: {result}")
     set_state(db, "current_focus", "nothing")
-    # Обновляем drives
-    drives["curiosity"] = min(1.0, drives.get("curiosity", 0.5) + 0.1)
-    drives["diligence"] = min(1.0, drives.get("diligence", 0.5) + 0.05)
+    # Насыщение: выполненное действие гасит потребность — уровень ПАДАЕТ
+    if decision in DUTY_KEYS:
+        drives["diligence"] = round(max(DRIVE_FLOOR,
+                                        drives.get("diligence", 0.5) - DRIVE_SAT_DILIGENCE), 2)
+    if decision == "explore_interest":
+        drives["curiosity"] = round(max(DRIVE_FLOOR,
+                                        drives.get("curiosity", 0.5) - DRIVE_SAT_CURIOSITY), 2)
+    else:
+        drives["curiosity"] = round(max(DRIVE_FLOOR,
+                                        drives.get("curiosity", 0.5) - DRIVE_SAT_PARTIAL), 2)
     set_state(db, "drives", drives)
     write_tick({"tick": tick_num, "action": decision, "result": result[:200], "ts": datetime.now(timezone.utc).isoformat()})
 
