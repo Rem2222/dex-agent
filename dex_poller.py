@@ -459,6 +459,7 @@ def _do_command(chat_id, cmd, rest):
         lv = int(raw)
         old_lv = get_access_level()
         set_access_level(lv)
+        log(f"Уровень доступа: {old_lv} -> {lv}")
         return (_access_text() + f"\n\nБыло: {old_lv} "
                 f"({LEVEL_NAMES[old_lv]}) → стало: {lv}.")
 
@@ -532,6 +533,12 @@ def handle_command(chat_id, text):
     token = parts[0]
     rest = parts[1].strip() if len(parts) > 1 else ""
     cmd = token.lstrip("/").lower()
+    # Telegram в группах присылает /access@Jawl_Moishe_bot — убираем суффикс,
+    # иначе команда не найдётся и молча уйдёт в обычный текст
+    if "@" in cmd:
+        cmd = cmd.split("@", 1)[0]
+    # Без этого команды не видны в журнале — их невозможно диагностировать
+    log(f"Команда: /{cmd} {rest[:50]} (chat_id={chat_id})")
 
     # «посмотреть уровень» — без подтверждения; «переключить» — с ним
     if cmd == "access" and not rest.strip():
@@ -560,6 +567,7 @@ def handle_command(chat_id, text):
             send_message(chat_id, "Подтверждение устарело (прошло 2 мин). Повтори команду.")
             return
         _state_set("pending_cmd", None)
+        log(f"/yes принят: {p.get('cmd')} {str(p.get('args'))[:40]}")
         send_message(chat_id,
                      f"✅ Подтверждено: /{p.get('cmd')} — выполняю…\n\n"
                      + _do_command(chat_id, p.get("cmd", ""), p.get("args", "")))
