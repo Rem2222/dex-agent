@@ -912,9 +912,13 @@ def execute_explore_interest(identity, db):
         f"Тема для исследования: {interest}\n"
         "Контекст: я — Dex, смотритель VPS. На сервере работают Hermes, "
         "Dex, Multica, OpenViking с векторной памятью, есть вики на markdown.\n"
-        "Дай ОДНО конкретное наблюдение, мысль или вопрос по этой теме, "
-        "который стоит проверить в первую очередь. 1-2 предложения, по-русски, "
-        "без общих слов."
+        "Дай ОДНО конкретное наблюдение по этой теме: 1-2 предложения, "
+        "по-русски, конкретно, без общих слов.\n"
+        "И добавь отдельной последней строкой ОДИН полезный URL по теме "
+        "(документация, релиз, статья) — формат: URL: https://...\n"
+        "URL обязан быть публичным: localhost, приватные сети и 127.0.0.1 "
+        "не подойдут, запрос всё равно отклонят. Если полезной страницы "
+        "нет — строку URL не пиши."
     )
     note = call_llm(
         "Ты — любопытный серверный помощник Dex. Отвечаешь по-русски, "
@@ -925,14 +929,34 @@ def execute_explore_interest(identity, db):
     )
     if not note or not str(note).strip():
         note = "LLM недоступна — наблюдение не получено"
-    note = str(note).strip().replace("\n", " ")[:300]
+    raw_note = str(note).strip()
+    # URL ищем ДО обрезки — иначе адрес, стоящий последним, отрезается
+    import re as _re
+    m = _re.search(r"https?://[^\s)>\]]+", raw_note)
+    note = " ".join(raw_note.split())[:300]
+
+    # Данные вместо одного мнения: если модель назвала страницу — читаем.
+    # Ошибки сети не должны ронять тик, поэтому только прибавляем.
+    if m:
+        url = m.group(0).rstrip(".,;")
+        try:
+            from dex_tools import tool_fetch_url
+            page = tool_fetch_url(url, lines=25)
+            if page and not str(page).startswith(("заблокировано", "не смог")):
+                snippet = " ".join(str(page).split())[:400]
+                note = f"{note}\nДанные с {url}: {snippet}"
+            else:
+                note = f"{note}\nСтраница {url} не прочитана: {str(page)[:120]}"
+        except Exception as e:
+            note = f"{note}\n(страницу прочитать не удалось: {e})"
+        note = note[:700]
 
     history = get_state(db, "explorations", [])
     if not isinstance(history, list):
         history = []
     history.append({
         "interest": interest,
-        "note": note,
+        "note": note[:600],
         "ts": datetime.now(timezone.utc).isoformat(),
     })
     set_state(db, "explorations", history[-20:])
@@ -943,7 +967,7 @@ def execute_explore_interest(identity, db):
     last[interest] = datetime.now(timezone.utc).isoformat()
     set_state(db, "last_explored_interest", last)
 
-    return f"{interest}: {note[:200]}"
+    return f"{interest}: {note[:700]}"
 
 
 if __name__ == "__main__":

@@ -242,6 +242,19 @@ TOOLS = [
         },
     },
     {
+        "name": "fetch_url",
+        "description": "Прочитать веб-страницу и получить её текст. Только публичные адреса: localhost, приватные сети и метаданные облака заблокированы.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Полный URL, http:// или https://"},
+                "lines": {"type": "integer", "description": "Сколько строк вернуть, до 400 (по умолчанию 200)"},
+                "as_text": {"type": "boolean", "description": "true — вернуть чистый текст без разметки (по умолчанию)"}
+            },
+            "required": ["url"],
+        },
+    },
+    {
         "name": "tail_log",
         "description": "Прочитать последние строки файла (журнал, лог, JSONL).",
         "parameters": {
@@ -778,6 +791,184 @@ def tool_run_script(name, inputs=None):
         if level == 2 and workdir is not None:
             shutil.rmtree(workdir, ignore_errors=True)
 
+# === ЧТЕНИЕ САЙТОВ (доступно на всех уровнях — это тоже чтение) ===
+FETCH_TIMEOUT = 15
+FETCH_MAX_BYTES = 400 * 1024
+FETCH_MAX_REDIRECTS = 5
+USER_AGENT = "DexBot/1.0 (+VPS caretaker; read-only fetch)"
+
+from urllib.request import HTTPRedirectHandler as _HRH  # нужно классу ниже
+
+
+class _NoRedirect(_HRH):
+    """Редиректы обрабатываем сами — иначе ушли бы на приватный адрес."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _public_ip(ip):
+    """True, если адрес публичный. Всё приватное/специальное — False."""
+    import ipaddress
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if a.version == 6 and a.ipv4_mapped is not None:
+        return _public_ip(str(a.ipv4_mapped))
+    return not (a.is_private or a.is_loopback or a.is_link_local
+                or a.is_multicast or a.is_reserved or a.is_unspecified)
+
+
+def _check_url(url):
+    """Валидация URL ДО запроса: схема, литерал IP, все адреса из DNS."""
+    import ipaddress, socket
+    from urllib.parse import urlparse
+    try:
+        u = urlparse(str(url).strip())
+    except Exception as e:
+        return False, f"не разобрал URL: {e}"
+    if u.scheme not in ("http", "https"):
+        return False, f"схема {u.scheme or '(пусто)'} запрещена — только http/https"
+    if not u.hostname:
+        return False, "в URL нет хоста"
+    host = u.hostname.lower()
+    if host in ("localhost", "metadata", "metadata.google.internal"):
+        return False, f"хост '{host}' заблокирован"
+    bare = host.strip("[]")
+    try:
+        ipaddress.ip_address(bare)
+        is_ip = True
+    except ValueError:
+        is_ip = False
+    if is_ip:
+        # литерал IP: проверяем напрямую, резолвить нечего
+        if not _public_ip(bare):
+            return False, f"адрес {bare} не публичный"
+        return True, None
+    try:
+        infos = socket.getaddrinfo(
+            host, u.port or (443 if u.scheme == "https" else 80),
+            proto=socket.IPPROTO_TCP)
+    except Exception as e:
+        return False, f"не разрешил {host}: {e}"
+    for info in infos:
+        ip = info[4][0].split("%")[0]
+        if not _public_ip(ip):
+            return False, f"{host} -> {ip} не публичный адрес"
+    return True, None
+
+
+def _html_to_text(html):
+    """Чистый текст из HTML: выкидываем скрипты, стили и разметку."""
+    from html.parser import HTMLParser
+
+    class P(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.skip = 0
+            self.out = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag in ("script", "style", "noscript", "svg", "head"):
+                self.skip += 1
+            if tag in ("p", "br", "div", "li", "tr", "h1", "h2", "h3",
+                       "h4", "section", "article"):
+                self.out.append("\n")
+
+        def handle_endtag(self, tag):
+            if tag in ("script", "style", "noscript", "svg", "head") and self.skip:
+                self.skip -= 1
+            if tag in ("p", "div", "li", "tr", "h1", "h2", "h3", "h4"):
+                self.out.append("\n")
+
+        def handle_data(self, data):
+            if not self.skip and data.strip():
+                self.out.append(data)
+
+    p = P()
+    try:
+        p.feed(html)
+    except Exception:
+        return html[:FETCH_MAX_BYTES]
+    lines = [" ".join(l.split()) for l in "".join(p.out).split("\n")]
+    return "\n".join(l for l in lines if l)
+
+
+def tool_fetch_url(url, lines=200, as_text=True):
+    """Читает страницу по URL и возвращает ТЕКСТ, а не HTML."""
+    import socket
+    from urllib.parse import urljoin
+    from urllib.request import Request, build_opener, HTTPRedirectHandler
+    from urllib.error import HTTPError, URLError
+
+    lines = max(1, min(int(lines or 200), 400))
+    current = str(url or "").strip()
+    if not current:
+        return "URL не указан"
+
+    seen, resp, ctype, raw, truncated = set(), None, "", b"", False
+    for _hop in range(FETCH_MAX_REDIRECTS + 1):
+        ok, why = _check_url(current)
+        if not ok:
+            return f"заблокировано: {why}"
+        if current in seen:
+            return "зацикленный редирект"
+        seen.add(current)
+
+        req = Request(current, headers={"User-Agent": USER_AGENT,
+                                        "Accept": "*/*"})
+        try:
+            resp = build_opener(_NoRedirect()).open(req, timeout=FETCH_TIMEOUT)
+        except HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308):
+                loc = e.headers.get("Location")
+                if not loc:
+                    return f"редирект {e.code} без Location"
+                current = urljoin(current, loc)
+                continue
+            return f"HTTP {e.code} {e.reason}"
+        except (URLError, socket.timeout, OSError) as e:
+            return f"не смог запросить: {type(e).__name__}: {e}"
+
+        if resp.status in (301, 302, 303, 307, 308):
+            loc = resp.headers.get("Location")
+            if not loc:
+                return f"редирект {resp.status} без Location"
+            current = urljoin(current, loc)
+            continue
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        while len(raw) < FETCH_MAX_BYTES:
+            chunk = resp.read(min(65536, FETCH_MAX_BYTES - len(raw)))
+            if not chunk:
+                break
+            raw += chunk
+        truncated = len(raw) >= FETCH_MAX_BYTES
+        resp.close()
+        break
+    else:
+        return f"слишком много редиректов (>{FETCH_MAX_REDIRECTS})"
+
+    charset = "utf-8"
+    if "charset=" in ctype:
+        charset = ctype.split("charset=")[-1].split(";")[0].strip() or "utf-8"
+    body = raw.decode(charset, errors="replace")
+    if as_text and "html" in ctype:
+        body = _html_to_text(body)
+
+    out = body.strip()
+    if not out:
+        return f"страница пуста (тип: {ctype or 'нет'})"
+    if len(out) > MAX_RESULT:
+        out = out[:MAX_RESULT] + f"\n... [обрезано, всего {len(out)} символов]"
+    out = "\n".join(out.splitlines()[:lines]) + (
+        f"\n[показано {lines} строк из {len(out.splitlines())}]"
+        if len(out.splitlines()) > lines else "")
+    head = (f"URL: {current}  |  {ctype or 'без типа'}"
+            + (f"  |  байт: {FETCH_MAX_BYTES} (лимит)" if truncated else ""))
+    return _clip(head + "\n" + out)
+
+
 def tool_tasks(action, what=None, id=None):
     """Задачи Dex: list — открыть, add — завести, done — закрыть."""
     import heartbeat as hb
@@ -829,6 +1020,7 @@ DISPATCH = {
     "run_cmd": tool_run_cmd,
     "write_file": tool_write_file,
     "run_script": tool_run_script,
+    "fetch_url": tool_fetch_url,
 }
 
 
