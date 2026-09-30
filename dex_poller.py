@@ -11,9 +11,11 @@ Dex Telegram Poller — ретранслятор сообщений из Dex б�
 import json
 import os
 import sqlite3
+import struct
 import subprocess
 import sys
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,6 +26,10 @@ IDENTITY_PATH = BASE_DIR / "identity.yaml"
 SESSIONS_DB = BASE_DIR / "sessions.db"
 AGENT_DB = BASE_DIR / "agent.db"
 TICK_LOG = BASE_DIR / "tick_history.jsonl"
+VEC_SO = BASE_DIR / "lib" / "vec0.so"
+OLLAMA_EMBED = "http://127.0.0.1:11434/api/embed"
+EMBED_MODEL = "bge-m3"
+EMBED_DIM = 1024
 POLL_INTERVAL = 3  # секунд между опросами
 DISABLED_FLAG = BASE_DIR / "DISABLED"
 
@@ -173,6 +179,79 @@ def read_state_summary(last_ticks=5):
     return "\n".join(lines)
 
 
+def embed_query(text):
+    """Эмбеддинг запроса через Ollama bge-m3 (1024 измерения). None при ошибке."""
+    try:
+        body = json.dumps({"model": EMBED_MODEL, "input": [text[:500]],
+                           "keep_alive": "10m"}).encode()
+        req = urllib.request.Request(OLLAMA_EMBED, data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode())["embeddings"][0]
+    except Exception as e:
+        log(f"память: эмбеддинг запроса не удался: {e}")
+        return None
+
+
+def search_memory(query, k=4, pool=30):
+    """Семантический поиск по собственным тикам (sqlite-vec + bge-m3).
+
+    Возвращает [{"tick", "ts", "action", "result", "distance"}].
+
+    vec0 не разрешает ORDER BY distance, rowid в одном KNN-запросе, поэтому
+    тянем пул и сортируем сами: дубликаты текста дают одинаковое расстояние,
+    и без второго ключа побеждал бы САМЫЙ СТАРЫЙ тик. Сортируем по
+    (расстояние, -тик) — при равенстве берём свежий.
+    """
+    vec = embed_query(query)
+    if not vec:
+        return []
+    try:
+        c = sqlite3.connect(f"file:{AGENT_DB}?mode=ro", uri=True, timeout=15)
+        c.enable_load_extension(True)
+        c.load_extension(str(VEC_SO))
+        c.execute("PRAGMA busy_timeout=5000")
+        blob = sqlite3.Binary(struct.pack("%df" % EMBED_DIM, *vec))
+        rows = c.execute("SELECT rowid, distance FROM vec_ticks "
+                         "WHERE embedding MATCH ? AND k=?",
+                         (blob, pool)).fetchall()
+        picked = sorted(rows, key=lambda r: (r[1], -r[0]))[:k]
+
+        out = []
+        for tick, dist in picked:
+            meta = c.execute("SELECT ts, action, result FROM ticks_meta WHERE tick=?",
+                             (tick,)).fetchone()
+            if not meta:
+                continue
+            out.append({"tick": tick, "ts": meta[0], "action": meta[1],
+                        "result": meta[2], "distance": round(dist, 3)})
+        c.close()
+        return out
+    except Exception as e:
+        log(f"память: поиск не удался: {e}")
+        return []
+
+
+MEMORY_HINTS = (
+    "был", "были", "было", "раньше", "вчера", "недавн", "давно", "прошл",
+    "предыдущ", "помни", "помню", "вспомни", "что было", "как было",
+    "что ты делал", "что делал", "истори", "проблем", "случал", "а когда",
+    "когда", "откуда", "первый раз", "в первый", "никогда", "постоянн",
+    "опять", "снова", "свеж",
+)
+
+
+def wants_memory(text):
+    """Нужен ли семантический поиск по прошлым тикам.
+
+    Эмбеддинг стоит 6-7 секунд, поэтому на обычные вопросы (и на вопросы
+    о текущем состоянии, где ответ уже есть в блоке состояния) поиск
+    пропускается.
+    """
+    low = (text or "").lower()
+    return any(h in low for h in MEMORY_HINTS)
+
+
 def get_updates():
     """Получает новые сообщения из Telegram Bot API"""
     global last_update_id
@@ -239,6 +318,27 @@ def process_message(msg_data):
           "- НЕ выдумывай, что искал по индексам, имеешь песочницу или доступ к чужим репозиториям.\n"
           "- Ответы про «параметры Gmail отключены» / «не могу использовать Workspace» — ошибка провайдера, а не твои слова: переспроси иначе.\n"
     )
+
+    # Векторная память нужна только на вопросы о прошлом: на вопросы о
+    # текущем состоянии ответ уже есть в блоке состояния, а эмбеддинг
+    # стоит 6-7 секунд и тормозит обычный чат.
+    memory = []
+    if wants_memory(text):
+        memory = search_memory(text, k=4)
+        if memory:
+            block = ["\n---\nПохожие тики из твоей памяти (semantic search):"]
+            for m in memory:
+                block.append(f"  #{m['tick']} {m['ts'][5:16]} {m['action']} -> "
+                             f"{m['result'][:120]}")
+            block.append("Это ИСТОРИЯ — данные могли устареть. Для текущего "
+                         "положения смотри блок «Твоё текущее состояние» выше.")
+            system_prompt += "\n".join(block)
+            log(f"память: подобрано {len(memory)} тиков для запроса")
+        else:
+            log("память: пусто (эмбеддинг недоступен или база пуста)")
+    else:
+        log("память: запрос не про прошлое, поиск пропущен")
+
     history = load_session(chat_id)
 
     messages = [{"role": "system", "content": system_prompt}]
