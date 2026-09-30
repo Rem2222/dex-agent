@@ -270,7 +270,7 @@ def get_updates():
     params = {
         "offset": last_update_id + 1 if last_update_id else 0,
         "timeout": 10,
-        "allowed_updates": ["message"]
+        "allowed_updates": ["message", "callback_query"]
     }
     try:
         result = subprocess.run(
@@ -542,7 +542,8 @@ def handle_command(chat_id, text):
 
     # «посмотреть уровень» — без подтверждения; «переключить» — с ним
     if cmd == "access" and not rest.strip():
-        send_message(chat_id, _access_text())
+        send_message(chat_id, _access_text() + "\n\nВыбери уровнем кнопкой "
+                    "или введи /access 1|2|3:", buttons=LEVEL_BUTTONS)
         return
 
     # переход НА 3 — безопасное направление, спрашивать незачем
@@ -557,25 +558,97 @@ def handle_command(chat_id, text):
         return
 
     # подтверждение / отмена
-    if cmd in ("yes", "y", "да", "ок"):
-        p = _state_get("pending_cmd")
-        if not p or p.get("chat_id") != chat_id:
-            send_message(chat_id, "Нет ожидающей команды.")
-            return
-        if time.time() - float(p.get("ts", 0)) > CONFIRM_TTL:
-            _state_set("pending_cmd", None)
-            send_message(chat_id, "Подтверждение устарело (прошло 2 мин). Повтори команду.")
-            return
+def _do_yes(chat_id):
+    """Общий обработчик подтверждения — и для /yes, и для кнопки «Да»."""
+    p = _state_get("pending_cmd")
+    if not p or p.get("chat_id") != chat_id:
+        return "Нет ожидающей команды."
+    if time.time() - float(p.get("ts", 0)) > CONFIRM_TTL:
         _state_set("pending_cmd", None)
-        log(f"/yes принят: {p.get('cmd')} {str(p.get('args'))[:40]}")
-        send_message(chat_id,
-                     f"✅ Подтверждено: /{p.get('cmd')} — выполняю…\n\n"
-                     + _do_command(chat_id, p.get("cmd", ""), p.get("args", "")))
+        return "Подтверждение устарело (прошло 2 мин). Повтори команду."
+    _state_set("pending_cmd", None)
+    log(f"подтверждено: {p.get('cmd')} {str(p.get('args'))[:40]}")
+    return (f"✅ Подтверждено: /{p.get('cmd')} — выполняю…\n\n"
+            + _do_command(chat_id, p.get("cmd", ""), p.get("args", "")))
+
+
+def _do_no(chat_id):
+    _state_set("pending_cmd", None)
+    return "Отменил."
+
+
+def _level_text(lv=None):
+    lv = get_access_level() if lv is None else lv
+    rows = {
+        3: "3 — только чтение: 9+1 инструментов, записи и запуска нет",
+        2: "2 — песочница: запись в sandbox/ и skills/, запуск от "
+           "nobody без сети, с лимитами",
+        1: "1 — root: запись по /root/.hermes и запуск от root",
+    }
+    return f"🔒 Сейчас уровень {lv}. {rows.get(lv, '')}"
+
+
+LEVEL_BUTTONS = [[("🔒 Только чтение (3)", "lv:3")],
+                 [("📦 Песочница (2)", "lv:2")],
+                 [("🔓 Root (1)", "lv:1")]]
+CONFIRM_BUTTONS = [[("✅ Да", "yes"), ("❌ Нет", "no")]]
+
+
+def handle_callback(cb):
+    """Нажатие inline-кнопки: callback_data = yes/no/lv:N/setlv:N."""
+    cb_id = cb.get("id") or ""
+    data = (cb.get("data") or "").strip()
+    chat_id = cb.get("message", {}).get("chat", {}).get("id")
+    try:
+        subprocess.run(
+            ["curl", "-s", "-X", "POST",
+             f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery",
+             "-H", "Content-Type: application/json",
+             "-d", json.dumps({"callback_query_id": cb_id})],
+            capture_output=True, text=True, timeout=10)
+    except Exception:
+        pass
+    if chat_id is None:
+        return
+    if chat_id not in ALLOWED_CHAT_IDS:
+        log(f"Кнопка отклонена: chat_id {chat_id} не в белом списке")
+        return
+
+    log(f"кнопка: {data} (chat_id={chat_id})")
+
+    if data == "yes":
+        send_message(chat_id, _do_yes(chat_id))
+        return
+    if data == "no":
+        send_message(chat_id, _do_no(chat_id))
+        return
+    if data.startswith("lv:"):
+        lv = data.split(":", 1)[1]
+        if lv not in ("1", "2", "3"):
+            send_message(chat_id, "Неизвестный уровень.")
+            return
+        cur = get_access_level()
+        if str(cur) == lv:
+            send_message(chat_id, _level_text() + "\nЭто уже текущий уровень.")
+            return
+        _state_set("pending_cmd", {"cmd": "access", "args": lv,
+                                   "chat_id": chat_id, "ts": time.time()})
+        send_message(
+            chat_id,
+            f"⚠️ Переключить уровень <b>{cur} → {lv}</b>?\n"
+            + _level_text(int(lv)) + "\n\nНажми «Да» или «Нет» "
+            "(действует 2 минуты, можно и /yes / /no).",
+            buttons=CONFIRM_BUTTONS)
+        return
+    send_message(chat_id, f"Неизвестная кнопка: {data}")
+
+
+    if cmd in ("yes", "y", "да", "ок"):
+        send_message(chat_id, _do_yes(chat_id))
         return
 
     if cmd in ("no", "n", "нет", "отмена"):
-        _state_set("pending_cmd", None)
-        send_message(chat_id, "Отменил.")
+        send_message(chat_id, _do_no(chat_id))
         return
 
     # опасные команды — спрашиваем
@@ -586,11 +659,13 @@ def handle_command(chat_id, text):
         hint = {"pause": "/pause [мин]",
                 "restart": "/restart",
                 "tick": "/tick"}.get(cmd, f"/{cmd}")
+        extra = _level_text(int(rest)) + "\n\n" if cmd == "access" and rest.strip() in ("1", "2", "3") else ""
         send_message(chat_id,
                      f"⚠️ <b>Подтверди</b>: <code>{hint}</code> "
                      f"{'с аргументом <code>' + rest + '</code> ' if rest else ''}"
-                     "отправь /yes — выполню, /no — отмена. "
-                     f"Действует {CONFIRM_TTL // 60} мин.")
+                     "— нажми «Да» или «Нет» (или отправь /yes, /no). "
+                     f"Действует {CONFIRM_TTL // 60} мин.\n\n" + extra,
+                     buttons=CONFIRM_BUTTONS)
         return
 
     # обычные команды
@@ -830,18 +905,26 @@ def chat_with_tools(messages, max_rounds=4):
     return text or "(не успел закончить: слишком много шагов подряд)"
 
 
-def send_message(chat_id, text):
-    """Отправляет сообщение в Telegram через Dex бота"""
+def send_message(chat_id, text, buttons=None):
+    """Отправляет сообщение в Telegram через Dex бота.
+
+    buttons — список строк вида [("Да", "yes"), ("Нет", "no")];
+    одна строка = один ряд inline-кнопок.
+    """
     try:
+        payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+        if buttons:
+            payload["reply_markup"] = {
+                "inline_keyboard": [
+                    [{"text": t, "callback_data": d} for t, d in row]
+                    for row in buttons
+                ]
+            }
         result = subprocess.run(
             ["curl", "-s", "-X", "POST",
              f"https://api.telegram.org/bot{bot_token}/sendMessage",
              "-H", "Content-Type: application/json",
-             "-d", json.dumps({
-                 "chat_id": chat_id,
-                 "text": text,
-                 "parse_mode": "HTML"
-             })],
+             "-d", json.dumps(payload)],
             capture_output=True, text=True, timeout=15
         )
         resp = json.loads(result.stdout)
@@ -937,7 +1020,13 @@ def main():
         try:
             updates = get_updates()
             for update in updates:
-                process_message(update)
+                if update.get("callback_query"):
+                    try:
+                        handle_callback(update["callback_query"])
+                    except Exception as e:
+                        log(f"callback error: {e}")
+                else:
+                    process_message(update)
 
             # Сохраняем offset
             offset_file.write_text(str(last_update_id))
