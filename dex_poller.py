@@ -19,6 +19,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from dex_tools import TOOLS, execute_tool
+
 # === CONFIG ===
 BASE_DIR = Path.home() / ".hermes" / "proactive"
 ENV_PATH = BASE_DIR / ".env"
@@ -312,10 +314,18 @@ def process_message(msg_data):
     system_prompt += (
         "\n\n---\nТвоё текущее состояние (читай, когда спрашивают о тебе, о тиках или о сервере):\n"
         + read_state_summary(5)
-        + "\n\nЧестность о возможностях:\n"
-          "- Сейчас у тебя НЕТ файловых инструментов: ты не открываешь файлы, не выполняешь команды, не ходишь в интернет.\n"
-          "- Если просят что-то найти, открыть или выполнить — скажи прямо, что пока не умеешь, и предложи сделать это Рому.\n"
-          "- НЕ выдумывай, что искал по индексам, имеешь песочницу или доступ к чужим репозиториям.\n"
+        + "\n\nУ тебя есть инструменты — вызывай их, когда нужно посмотреть что-то реально:\n"
+          "- read_state() — состояние сервера и твои драйвы\n"
+          "- run_check(name) — чеки: backups, updates, disk, services, tools\n"
+          "- read_file(path, limit) — прочитать файл\n"
+          "- list_dir(path) — содержимое каталога\n"
+          "- tail_log(path, lines) — последние строки журнала\n"
+          "Песочница разрешает ТОЛЬКО чтение и только эти каталоги: /root/.hermes/proactive, "
+          "/root/.hermes/scripts, /root/backups, /var/log, /etc, /root/Documents/wiki/ops/services.\n"
+          "Доступа в интернет нет, записи в файлы нет, запуска произвольных программ нет, "
+          "секреты (.env, auth.json, ключи) закрыты.\n"
+          "- Если нужного пути нет в списке — скажи прямо, что не можешь, не выдумывай.\n"
+          "- Если инструмент вернул ошибку или отказ песочницы — передай это как есть.\n"
           "- Ответы про «параметры Gmail отключены» / «не могу использовать Workspace» — ошибка провайдера, а не твои слова: переспроси иначе.\n"
     )
 
@@ -348,7 +358,7 @@ def process_message(msg_data):
     messages.append({"role": "user", "content": text})
 
     # Вызываем Hermes Gateway
-    response = call_hermes(messages)
+    response = chat_with_tools(messages)
     if not response:
         send_message(chat_id, "🙈 Сорян, не смог связаться с мозгом. Попробуй позже.")
         return
@@ -377,17 +387,28 @@ def _is_google_tool_error(text):
     return any(m.lower() in low for m in GOOGLE_TOOL_ERROR_MARKERS)
 
 
-def call_hermes(messages):
-    """Вызывает LLM-провайдера Dex (DEX_API_URL, см. .env).
+def call_hermes(messages, tools=None):
+    """Вызывает LLM-провайдер Dex (DEX_API_URL, см. .env).
 
     Раньше был жёстко захардкожен Gateway (127.0.0.1:8642) + модель
     deepseek-v4-flash. Ключ GATEWAY_KEY перестал действовать: секции
     api_server в config.yaml нет, API_SERVER_KEY не задан → 401.
     Теперь дефолт — gemini-web2api на 8083 (бесплатный, без Gateway).
 
-    На запросы про файлы/документы провайдер иногда возвращает текст ошибки
-    Workspace. Ловим, повторяем один раз, при повторе — честный ответ.
+    Возвращает пару (text, tool_calls):
+      - text — текст ответа либо None при ошибке провайдера;
+      - tool_calls — список вызовов инструментов OpenAI-формата, пустой
+        список, если модель ответила текстом.
     """
+    payload = {
+        "model": DEX_MODEL,
+        "messages": messages,
+        "max_tokens": 1000,
+        "temperature": 0.7,
+    }
+    if tools:
+        payload["tools"] = tools
+
     for attempt in (1, 2):
         result = None
         try:
@@ -395,24 +416,26 @@ def call_hermes(messages):
                 ["curl", "-s", "-X", "POST",
                  DEX_API_URL,
                  "-H", "Content-Type: application/json",
-                 "-H", "Authorization: Bearer " + DEX_API_KEY,
-                 "-d", json.dumps({
-                     "model": DEX_MODEL,
-                     "messages": messages,
-                     "max_tokens": 1000,
-                     "temperature": 0.7
-                 })],
+                 "-H", "Authorization: " + "Bearer " + DEX_API_KEY,
+                 "-d", json.dumps(payload)],
                 capture_output=True, text=True, timeout=60
             )
             resp = json.loads(result.stdout)
-            content = resp["choices"][0]["message"]["content"]
+            msg = resp["choices"][0]["message"]
+            content = msg.get("content")
+            tool_calls = msg.get("tool_calls") or []
         except Exception as e:
             log(f"LLM API error: {e}")
             if result is not None and result.stdout:
                 log(f"Raw: {result.stdout[:200]}")
-            return None
+            return (None, [])
 
         text = (content or "").strip()
+
+        # Инструменты отдаём сразу: на tool_calls ошибка Workspace
+        # не накладывается, а повтор сломал бы вызов.
+        if tool_calls:
+            return (text, tool_calls)
 
         if _is_google_tool_error(text) and attempt == 1:
             log("LLM: ошибка Workspace от провайдера, повторяю запрос")
@@ -421,11 +444,56 @@ def call_hermes(messages):
 
         if _is_google_tool_error(text):
             log("LLM: ошибка Workspace повторилась — отдаю честный ответ")
-            return ("Не смог выполнить: у меня нет доступа к файлам и документам, "
-                    "а провайдер на такие запросы отвечает ошибкой Workspace. "
-                    "Сформулируй иначе — или сделай это сам.")
-        return text
-    return None
+            return ("Не смог выполнить: провайдер на такие запросы отвечает "
+                    "ошибкой Workspace. Сформулируй иначе — или сделай это сам.", [])
+        return (text, [])
+    return (None, [])
+
+
+def chat_with_tools(messages, max_rounds=4):
+    """Диалог с инструментами: пока модель просит tool_call — выполняем.
+
+    Правила песочницы — см. dex_tools.py. Всегда возвращает строку
+    либо None (если провайдер недоступен).
+    """
+    text = None
+    for step in range(1, max_rounds + 1):
+        text, tool_calls = call_hermes(messages, tools=TOOLS)
+        if text is None and not tool_calls:
+            return None
+        if not tool_calls:
+            return text
+
+        log(f"тулзы: шаг {step}/{max_rounds}, запросов {len(tool_calls)}")
+        calls = []
+        for i, tc in enumerate(tool_calls):
+            fn = tc.get("function") or {}
+            calls.append({
+                "id": tc.get("id") or f"call_{i}",
+                "type": "function",
+                "function": {
+                    "name": fn.get("name", "?"),
+                    "arguments": fn.get("arguments", "{}"),
+                },
+            })
+        messages.append({"role": "assistant",
+                         "content": text or "",
+                         "tool_calls": calls})
+
+        for tc in calls:
+            name = tc["function"]["name"]
+            args = tc["function"]["arguments"]
+            out = execute_tool(name, args)
+            log(f"  -> {name}({args[:70]}) => {str(out)[:110]}")
+            messages.append({"role": "tool",
+                             "tool_call_id": tc["id"],
+                             "content": out})
+
+    # Лимит шагов: просим итоговый ответ уже без инструментов
+    log("тулзы: превышен лимит шагов, запрашиваю итог без инструментов")
+    text, _ = call_hermes(messages, tools=None)
+    return text or "(не успел закончить: слишком много шагов подряд)"
+
 
 def send_message(chat_id, text):
     """Отправляет сообщение в Telegram через Dex бота"""
