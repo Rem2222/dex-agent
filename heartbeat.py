@@ -36,6 +36,9 @@ NOTIFY_COOLDOWN_SECONDS = {
     "check_updates": 24 * 3600,
     "check_disk": 6 * 3600,
     "check_tools": 24 * 3600,
+    # Находки должны доезжать: раньше был дефолт 24ч — за сутки он
+    # успевал исследовать 4 раза, а до Рома дошло бы одно.
+    "explore_interest": 4 * 3600,
 }
 DIGEST_INTERVAL_SECONDS = 24 * 3600
 DIGEST_MAX_ENTRIES = 12
@@ -480,12 +483,20 @@ def main():
         prompt_parts.append("Последние тики:")
         for h in history:
             prompt_parts.append(f"  - {h.get('action', 'ничего')} → {h.get('result', '?')}")
-    prompt_parts.append("""Что делаем в этом тике? Ответь ТОЛЬКО одним словом — одним из: check_updates, check_backups, check_disk, check_tools, check_services, explore_interest, none. Никаких других слов, никаких пояснений.""")
+    # Что реально можно выбрать в ЭТОМ тике: привычка/исследование всегда,
+    # обязанности — только те, что подошли по интервалу.
+    available = ["none", "explore_interest"] + list(duty_due)
+    prompt_parts.append(
+        "Что делаем в этом тике? Ответь ТОЛЬКО одним словом — одним из: "
+        + ", ".join(available)
+        + ". Никаких других слов, никаких пояснений. Обязанности, которых "
+        "нет в этом списке, уже сделаны — не повторяй их.")
     prompt = "\n".join(prompt_parts)
 
     # 5. Зовём LLM
     decision = call_llm(
-        "Ты — серверный помощник Dex. Отвечаешь ТОЛЬКО одним словом: check_updates, check_backups, check_disk, check_tools, check_services, explore_interest, none. Никаких других слов.",
+        "Ты — серверный помощник Dex. Отвечаешь ТОЛЬКО одним словом из списка, "
+        "который дан в задании. Никаких других слов.",
         prompt,
         max_tokens=20,
         db=db,
@@ -508,6 +519,19 @@ def main():
         log(f"Dex ответил невалидным ключом: {decision}, пропускаю тик")
         set_state(db, "current_focus", "nothing")
         write_tick({"tick": tick_num, "action": "none", "result": f"bogus: {decision}", "ts": datetime.now(timezone.utc).isoformat()})
+        return
+
+    # Страховка: если LLM выбрал обязанность вне расписания — не выполняем,
+    # тик уходит в простой (тогда curiosity растёт).
+    if decision in DUTY_KEYS and decision not in duty_due:
+        log(f"повтор {decision} вне интервала — пропускаю")
+        set_state(db, "current_focus", "nothing")
+        drives["curiosity"] = round(min(DRIVE_CEIL,
+                                        drives.get("curiosity", 0.5) + DRIVE_STEP_IDLE), 2)
+        set_state(db, "drives", drives)
+        write_tick({"tick": tick_num, "action": "none",
+                    "result": f"повтор {decision} вне интервала",
+                    "ts": datetime.now(timezone.utc).isoformat()})
         return
 
     decision = decision.strip().lower()
@@ -534,6 +558,14 @@ def main():
     # Замеченное, но неисправимое — в задачи (дедуп по тексту)
     maybe_file_task(db, decision, result)
 
+    # Отметили выполнение обязанности — БЕЗ ЭТОГО check_duty считает
+    # last_check = 0 и каждый тик возвращает все пять, то есть
+    # «Пора проверить» висит всегда и LLM повторяет одно и то же.
+    if decision in DUTY_KEYS:
+        dc = get_state(db, "duty_checks", {})
+        dc[decision] = datetime.now(timezone.utc).timestamp()
+        set_state(db, "duty_checks", dc)
+
     # 7. Логируем результат
     log(f"Результат: {result}")
     set_state(db, "current_focus", "nothing")
@@ -544,7 +576,11 @@ def main():
     if decision == "explore_interest":
         drives["curiosity"] = round(max(DRIVE_FLOOR,
                                         drives.get("curiosity", 0.5) - DRIVE_SAT_CURIOSITY), 2)
-    else:
+    elif decision not in DUTY_KEYS:
+        # Обязанность любопытство НЕ гасит: проверка диска никак не связана
+        # с интересом. Раньше это была ветка else — и она ловила все 5
+        # обязанностей, то есть 84% тиков. Из-за этого curiosity держался
+        # на поле (среднее 0.14), а подсказка ≥0.7 не срабатывала ни разу.
         drives["curiosity"] = round(max(DRIVE_FLOOR,
                                         drives.get("curiosity", 0.5) - DRIVE_SAT_PARTIAL), 2)
     set_state(db, "drives", drives)
