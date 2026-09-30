@@ -12,6 +12,8 @@ Dex работает от root, поэтому доступ строго огр�
 OpenAI — см. chat_with_tools() в dex_poller.py.
 """
 import json
+import os
+import re
 import sqlite3
 from pathlib import Path
 
@@ -189,6 +191,30 @@ TOOLS = [
         },
     },
     {
+        "name": "run_cmd",
+        "description": "Выполнить проверенную заранее команду из списка шаблонов. НЕ произвольная строка: ты выбираешь шаблон и подставляешь параметры.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "template": {
+                    "type": "string",
+                    "enum": ["journalctl-unit", "journalctl-since",
+                             "systemctl-status", "systemctl-user-status",
+                             "docker-logs", "docker-inspect",
+                             "git-log", "git-status",
+                             "net-ports", "memory", "load",
+                             "top-by-mem", "disk-inodes", "docker-stats"],
+                    "description": "Какой шаблон выполнить"
+                },
+                "args": {
+                    "type": "object",
+                    "description": "Параметры шаблона: например unit=dex-poller, lines=50, name=gemini-web2api",
+                }
+            },
+            "required": ["template"],
+        },
+    },
+    {
         "name": "tail_log",
         "description": "Прочитать последние строки файла (журнал, лог, JSONL).",
         "parameters": {
@@ -312,6 +338,180 @@ def tool_run_check(name):
     return _clip(dispatch[name]())
 
 
+# === ШАБЛОНЫ КОМАНД (Вариант А) ===
+# Не строка, которую модель придумала, а заранее описанный argv.
+# Каждый слот имеет свой regex; значение с ведущим '-' не проходит —
+# иначе юнит вида '--version' превратился бы в флаг systemctl.
+RE_UNIT = "^[A-Za-z0-9_.@-]{1,64}$"
+RE_INT = "^[1-9][0-9]{0,4}$"
+RE_NAME = "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"
+RE_PATH = r"^/root/[\w./-]{1,150}$"  # абсолютные пути под /root
+RE_WHEN = r"^(?:[0-9]+ (?:minutes?|hours?|days?) ago|today|yesterday)$"
+
+COMMAND_TEMPLATES = {
+    "journalctl-unit": {
+        "desc": "Журнал systemd-юнита: journalctl -u <unit> -n <lines>",
+        "argv": ["journalctl", "-u", "{unit}", "-n", "{lines}", "--no-pager"],
+        "slots": {"unit": (True, RE_UNIT, None), "lines": (False, RE_INT, "50")},
+        "timeout": 25,
+    },
+    "journalctl-since": {
+        "desc": "Журнал за период: journalctl --since <when> -n <lines>",
+        "argv": ["journalctl", "--since", "{when}", "-n", "{lines}", "--no-pager"],
+        "slots": {"when": (True, RE_WHEN, "1 hour ago"), "lines": (False, RE_INT, "100")},
+        "timeout": 25,
+    },
+    "systemctl-status": {
+        "desc": "Статус юнита: systemctl status <unit>",
+        "argv": ["systemctl", "status", "{unit}", "--no-pager", "-l"],
+        "slots": {"unit": (True, RE_UNIT, None)},
+        "timeout": 15,
+    },
+    "systemctl-user-status": {
+        "desc": "Статус ПОЛЬЗОВАТЕЛЬСКОГО юнита (dex-* живут здесь): --user status",
+        "argv": ["systemctl", "--user", "status", "{unit}", "--no-pager", "-l"],
+        "slots": {"unit": (True, RE_UNIT, None)},
+        "timeout": 15,
+    },
+    "docker-logs": {
+        "desc": "Последние строки журнала контейнера: docker logs --tail",
+        "argv": ["docker", "logs", "--tail", "{lines}", "{name}"],
+        "slots": {"name": (True, RE_NAME, None), "lines": (False, RE_INT, "80")},
+        "timeout": 25,
+    },
+    "docker-inspect": {
+        "desc": "Конфигурация контейнера + статус (без вывода логов)",
+        "argv": ["docker", "inspect", "--format",
+                 "{{.Name}} {{.State.Status}} restarts={{.RestartCount}} "
+                 "oom={{.State.OOMKilled}} started={{.State.StartedAt}}",
+                 "{name}"],
+        "slots": {"name": (True, RE_NAME, None)},
+        "timeout": 15,
+    },
+    "git-log": {
+        "desc": "Последние коммиты репозитория (путь должен лежать под /root)",
+        "argv": ["git", "-C", "{repo}", "log", "--oneline", "--date=short",
+                 "--pretty=%h %ad %s", "-n", "{lines}"],
+        "slots": {"repo": (True, RE_PATH, None), "lines": (False, RE_INT, "15")},
+        "timeout": 15,
+    },
+    "git-status": {
+        "desc": "Состояние репозитория: git status --short",
+        "argv": ["git", "-C", "{repo}", "status", "--short"],
+        "slots": {"repo": (True, RE_PATH, None)},
+        "timeout": 15,
+    },
+    "net-ports": {
+        "desc": "Открытые TCP-порты и кто их держит: ss -tlnp",
+        "argv": ["ss", "-tlnp"],
+        "slots": {},
+        "timeout": 15,
+    },
+    "memory": {
+        "desc": "Память и подкачка: free -m",
+        "argv": ["free", "-m"],
+        "slots": {},
+        "timeout": 10,
+    },
+    "load": {
+        "desc": "Аптайм и средняя нагрузка: uptime",
+        "argv": ["uptime"],
+        "slots": {},
+        "timeout": 10,
+    },
+    "top-by-mem": {
+        "desc": "Топ процессов по памяти: ps aux --sort=-%mem",
+        "argv": ["ps", "aux", "--sort=-%mem"],
+        "slots": {},
+        "timeout": 15,
+    },
+    "disk-inodes": {
+        "desc": "Свободные inode и монтирования: df -ih",
+        "argv": ["df", "-ih"],
+        "slots": {},
+        "timeout": 10,
+    },
+    "docker-stats": {
+        "desc": "Расход ресурсов контейнеров одним снимком",
+        "argv": ["docker", "stats", "--no-stream",
+                 "--format", "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"],
+        "slots": {},
+        "timeout": 30,
+    },
+}
+
+CMD_DESC = "\n".join(f"  {k} — {v['desc']}" for k, v in COMMAND_TEMPLATES.items())
+
+
+def _xdg_env(argv):
+    """Окружение для запуска: для --user команд нужен XDG_RUNTIME_DIR."""
+    env = os.environ.copy()
+    if "--user" in argv and not env.get("XDG_RUNTIME_DIR"):
+        import os as _os
+        cand = f"/run/user/{_os.getuid()}"
+        if Path(cand).is_dir():
+            env["XDG_RUNTIME_DIR"] = cand
+    return env
+
+
+def tool_run_cmd(template, args=None):
+    """Исполняет заранее описанный шаблон. Список argv, shell=False."""
+    import subprocess
+    t = COMMAND_TEMPLATES.get(template)
+    if t is None:
+        return (f"нет шаблона '{template}'. Доступные:\n{CMD_DESC}")
+
+    args = args if isinstance(args, dict) else {}
+
+    # 1. значения слотов с валидацией
+    values = {}
+    for slot, (required, pattern, default) in t["slots"].items():
+        raw = args.get(slot, default)
+        if raw is None or str(raw).strip() == "":
+            if required:
+                return f"шаблон {template} требует параметр '{slot}'"
+            raw = default
+        val = str(raw).strip()
+        if val.startswith("-"):
+            return f"отказано: параметр '{slot}' не может начинаться с '-'"
+        if not re.match(pattern, val):
+            return f"параметр '{slot}' не проходит проверку: {val!r}"
+        # слот-путь: та же защита секретов, что и в safe_path
+        if slot in ("repo", "path", "file"):
+            low = val.lower()
+            for deny in DENY_SUBSTRINGS:
+                if deny in low:
+                    return f"отказано песочницей: доступ к '{deny}' закрыт"
+        values[slot] = val
+
+    # 2. подстановка в argv — построчно, shell=False, без format()
+    #    (format сломал бы {{.Name}} в шаблонах docker)
+    argv = list(t["argv"])
+    for slot, val in values.items():
+        argv = [tok.replace("{" + slot + "}", val) for tok in argv]
+
+    # 3. неподставленный плейсхолдер = ошибка сборки, не рискнем
+    left = [tok for tok in argv
+            if "{" in tok.replace("{{", "").replace("}}", "")]
+    if left:
+        return "не подставлены параметры: " + " ".join(left)
+
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True,
+                           timeout=t.get("timeout", 20),
+                           env=_xdg_env(argv))
+    except FileNotFoundError:
+        return f"команда не найдена: {argv[0]}"
+    except subprocess.TimeoutExpired:
+        return f"таймаут {t.get('timeout', 20)}с: {' '.join(argv[:4])}"
+    except Exception as e:
+        return f"ошибка запуска: {type(e).__name__}: {e}"
+
+    body = (r.stdout or "") + (("STDERR:\n" + r.stderr) if r.stderr and r.stderr.strip() else "")
+    head = f"$ {' '.join(argv)}  →  код {r.returncode}"
+    return _clip(head + "\n" + body.strip())
+
+
 def tool_tasks(action, what=None, id=None):
     """Задачи Dex: list — открыть, add — завести, done — закрыть."""
     import heartbeat as hb
@@ -360,6 +560,7 @@ DISPATCH = {
     "list_skills": lambda **_: tool_list_skills(),
     "read_skill": tool_read_skill,
     "tasks": tool_tasks,
+    "run_cmd": tool_run_cmd,
 }
 
 

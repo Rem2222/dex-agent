@@ -774,7 +774,22 @@ def _registry_units():
                 u = line.strip().lstrip("-").strip()
                 if u:
                     units.add(u)
+    # Жёсткая валидация: имя юнита уходит в argv systemctl. Без неё
+    # запись из вики вида '--version' или 'a b' стала бы флагом либо
+    # лишним аргументом. Разрешены буквы, цифры и _.@-
+    units = {u for u in units
+             if re.fullmatch(r"[A-Za-z0-9_.@\-]{1,64}", u)}
     return pages, sorted(units)
+
+
+def _xdg_env():
+    """XDG_RUNTIME_DIR для systemctl --user: без него «No medium found»."""
+    env = os.environ.copy()
+    if not env.get("XDG_RUNTIME_DIR"):
+        cand = f"/run/user/{os.getuid()}"
+        if os.path.isdir(cand):
+            env["XDG_RUNTIME_DIR"] = cand
+    return env
 
 
 def _user_unit_names():
@@ -783,7 +798,8 @@ def _user_unit_names():
         out = subprocess.run(
             ["systemctl", "--user", "list-unit-files", "--no-legend",
              "--plain", "--no-pager"],
-            capture_output=True, text=True, timeout=15
+            capture_output=True, text=True, timeout=15,
+            env=_xdg_env()
         ).stdout
     except Exception:
         return set()
@@ -796,6 +812,9 @@ def _unit_states(units):
     Без этого dex-poller и dex-control числились «inactive», хотя работают:
     они установлены в менеджере сеанса, а не в системном.
     """
+    # вторая линия обороны: чистим и здесь
+    units = [u for u in units
+             if re.fullmatch(r"[A-Za-z0-9_.@\-]{1,64}", str(u))]
     user_files = _user_unit_names()
 
     def is_user(u):
@@ -807,14 +826,16 @@ def _unit_states(units):
         if not group:
             continue
         r = subprocess.run(["systemctl", *flag, "is-active", *group],
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, timeout=30,
+                           env=_xdg_env())
         vals = [ln.strip() for ln in r.stdout.splitlines()]
         if len(vals) != len(group):
             # ответ неполный — по одному, чтобы не приписать чужое состояние
             vals = []
             for u in group:
                 q = subprocess.run(["systemctl", *flag, "is-active", u],
-                                   capture_output=True, text=True, timeout=5)
+                                   capture_output=True, text=True, timeout=5,
+                                   env=_xdg_env())
                 vals.append(q.stdout.strip())
         for u, st in zip(group, vals):
             states[u] = (st or "unknown").strip()
