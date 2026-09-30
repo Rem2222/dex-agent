@@ -16,4 +16,3 @@ __pycache__/
 *.pyc
 .DS_Store
 venv/
-__pycache__/

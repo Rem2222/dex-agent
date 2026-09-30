@@ -339,18 +339,27 @@ def main():
     set_state(db, "drives", drives)
     write_tick({"tick": tick_num, "action": decision, "result": result[:200], "ts": datetime.now(timezone.utc).isoformat()})
 
-    # 8. Отправляем уведомление в Telegram — только аномалии, с кулдауном
-    notify = format_notification(decision, result)
-    if notify:
-        if should_notify(db, decision, notify):
-            send_telegram(notify)
+    # 8. Отчёт в Telegram — на каждое действие, кроме none.
+    #    Обещание дано 30.09 («на каждый тик отписываться, если ты что-то делаешь»).
+    #    Кулдаун на идентичный текст не даёт заспамить: 15 одинаковых проверок = 1 сообщение.
+    anomaly = format_notification(decision, result)
+    icon = {"check_disk": "💾", "check_backups": "💿", "check_updates": "🔄",
+            "check_services": "🔍", "check_tools": "🔧",
+            "explore_interest": "🧠"}.get(decision, "▫️")
+    notify = anomaly or f"{icon} <b>{decision}</b>: {result}"
+
+    if should_notify(db, decision, notify):
+        if send_telegram(notify):
             mark_notified(db, decision, notify)
+            log(f"Telegram: отчёт по {decision} отправлен")
         else:
-            log(f"Telegram: {decision} — кулдаун, пропускаю (уже слали то же)")
+            log(f"Telegram: не удалось отправить отчёт по {decision}")
     else:
-        # Рутина — не в Telegram, а в ежедневный дайджест
-        add_digest_entry(db, decision, result)
-        maybe_send_digest(db)
+        log(f"Telegram: {decision} — кулдаун, пропускаю (уже слали то же)")
+
+    # Дайджест — отдельный сводный отчёт раз в сутки (оставлен намеренно)
+    add_digest_entry(db, decision, result)
+    maybe_send_digest(db)
 
 def should_notify(db, action, text):
     """Кулдаун: не слать то же сообщение чаще раза в N часов."""

@@ -22,6 +22,8 @@ BASE_DIR = Path.home() / ".hermes" / "proactive"
 ENV_PATH = BASE_DIR / ".env"
 IDENTITY_PATH = BASE_DIR / "identity.yaml"
 SESSIONS_DB = BASE_DIR / "sessions.db"
+AGENT_DB = BASE_DIR / "agent.db"
+TICK_LOG = BASE_DIR / "tick_history.jsonl"
 POLL_INTERVAL = 3  # секунд между опросами
 DISABLED_FLAG = BASE_DIR / "DISABLED"
 
@@ -119,6 +121,55 @@ def build_system_prompt(identity):
     )
     return "\n".join(parts)
 
+def read_state_summary(last_ticks=5):
+    """Компактное состояние Dex: тик, фокус, драйвы, последние тики.
+
+    Раньше этого блока не было вовсе — в чат уходил только текст identity.yaml
+    и последние 10 реплик, поэтому Dex не мог ответить «что ты проверял».
+    """
+    lines = []
+    try:
+        db = sqlite3.connect(f"file:{AGENT_DB}?mode=ro", uri=True)
+        state = dict(db.execute("SELECT key, value FROM state").fetchall())
+        db.close()
+
+        tick = state.get("tick_count", "?")
+        focus = state.get("current_focus", "nothing")
+        try:
+            drives = json.loads(state.get("drives", "{}"))
+        except Exception:
+            drives = {}
+        cur = drives.get("curiosity", "?")
+        dil = drives.get("diligence", "?")
+        lines.append(f"тик #{tick} | фокус: {focus}")
+        lines.append(f"драйвы: любопытство {cur}, исполнительность {dil}")
+    except Exception as e:
+        lines.append(f"состояние недоступно: {e}")
+
+    try:
+        rows = []
+        if TICK_LOG.exists():
+            with open(TICK_LOG) as f:
+                for raw in f:
+                    raw = raw.strip()
+                    if raw:
+                        try:
+                            rows.append(json.loads(raw))
+                        except Exception:
+                            pass
+        for r in rows[-last_ticks:]:
+            act = r.get("action", "?")
+            res = str(r.get("result", ""))[:110]
+            ts = str(r.get("ts", ""))[11:16]
+            lines.append(f"  {ts} {act} -> {res}")
+        if not rows:
+            lines.append("  (история тиков пуста)")
+    except Exception as e:
+        lines.append(f"  история тиков недоступна: {e}")
+
+    return "\n".join(lines)
+
+
 def get_updates():
     """Получает новые сообщения из Telegram Bot API"""
     global last_update_id
@@ -193,6 +244,23 @@ def process_message(msg_data):
     # Отправляем ответ
     send_message(chat_id, response)
 
+GOOGLE_TOOL_ERROR_MARKERS = (
+    "параметры Gmail отключены",
+    "не могу использовать Workspace",
+    "не могу использовать Google Drive",
+)
+
+
+def _is_google_tool_error(text):
+    """Сервер Google возвращает это, когда его расширение Workspace недоступно.
+
+    Воспроизведено отдельным чистым запросом: просьба «открой файлы, найди
+    правила» даёт ровно этот текст — провайдерная ошибка, а не ответ модели.
+    """
+    low = (text or "").lower()
+    return any(m.lower() in low for m in GOOGLE_TOOL_ERROR_MARKERS)
+
+
 def call_hermes(messages):
     """Вызывает LLM-провайдера Dex (DEX_API_URL, см. .env).
 
@@ -200,29 +268,48 @@ def call_hermes(messages):
     deepseek-v4-flash. Ключ GATEWAY_KEY перестал действовать: секции
     api_server в config.yaml нет, API_SERVER_KEY не задан → 401.
     Теперь дефолт — gemini-web2api на 8083 (бесплатный, без Gateway).
+
+    На запросы про файлы/документы провайдер иногда возвращает текст ошибки
+    Workspace. Ловим, повторяем один раз, при повторе — честный ответ.
     """
-    try:
-        result = subprocess.run(
-            ["curl", "-s", "-X", "POST",
-             DEX_API_URL,
-             "-H", "Content-Type: application/json",
-             "-H", "Authorization: Bearer " + DEX_API_KEY,
-             "-d", json.dumps({
-                 "model": DEX_MODEL,
-                 "messages": messages,
-                 "max_tokens": 1000,
-                 "temperature": 0.7
-             })],
-            capture_output=True, text=True, timeout=60
-        )
-        resp = json.loads(result.stdout)
-        content = resp["choices"][0]["message"]["content"]
-        return content.strip()
-    except Exception as e:
-        log(f"Hermes API error: {e}")
-        if 'result' in dir() and result.stdout:
-            log(f"Raw: {result.stdout[:200]}")
-        return None
+    for attempt in (1, 2):
+        result = None
+        try:
+            result = subprocess.run(
+                ["curl", "-s", "-X", "POST",
+                 DEX_API_URL,
+                 "-H", "Content-Type: application/json",
+                 "-H", "Authorization: Bearer " + DEX_API_KEY,
+                 "-d", json.dumps({
+                     "model": DEX_MODEL,
+                     "messages": messages,
+                     "max_tokens": 1000,
+                     "temperature": 0.7
+                 })],
+                capture_output=True, text=True, timeout=60
+            )
+            resp = json.loads(result.stdout)
+            content = resp["choices"][0]["message"]["content"]
+        except Exception as e:
+            log(f"LLM API error: {e}")
+            if result is not None and result.stdout:
+                log(f"Raw: {result.stdout[:200]}")
+            return None
+
+        text = (content or "").strip()
+
+        if _is_google_tool_error(text) and attempt == 1:
+            log("LLM: ошибка Workspace от провайдера, повторяю запрос")
+            time.sleep(1)
+            continue
+
+        if _is_google_tool_error(text):
+            log("LLM: ошибка Workspace повторилась — отдаю честный ответ")
+            return ("Не смог выполнить: у меня нет доступа к файлам и документам, "
+                    "а провайдер на такие запросы отвечает ошибкой Workspace. "
+                    "Сформулируй иначе — или сделай это сам.")
+        return text
+    return None
 
 def send_message(chat_id, text):
     """Отправляет сообщение в Telegram через Dex бота"""
