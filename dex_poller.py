@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dex_tools import TOOLS, execute_tool, skills_index_text
@@ -34,6 +34,13 @@ EMBED_MODEL = "bge-m3"
 EMBED_DIM = 1024
 POLL_INTERVAL = 3  # секунд между опросами
 DISABLED_FLAG = BASE_DIR / "DISABLED"
+
+# === Белый список: личный бот, команды и чат только для Рома ===
+# Раньше chat_id не проверялся вовсе — бота мог завести кто угодно.
+ALLOWED_CHAT_IDS = {386235337}
+# Команды, которым нужно подтверждение /yes
+CONFIRM_CMDS = {"pause", "restart", "tick"}
+CONFIRM_TTL = 120  # секунд живёт ожидающая команда
 
 
 def load_env_file():
@@ -284,6 +291,268 @@ def get_updates():
         log(f"getUpdates exception: {e}")
         return []
 
+def _state_get(key, default=None):
+    """Читает один ключ из state в agent.db (не тащит весь файл)."""
+    try:
+        db = sqlite3.connect(AGENT_DB)
+        row = db.execute("SELECT value FROM state WHERE key=?",
+                         (key,)).fetchone()
+        db.close()
+        if not row:
+            return default
+        try:
+            return json.loads(row[0])
+        except Exception:
+            return row[0]
+    except Exception:
+        return default
+
+
+def _state_set(key, value):
+    try:
+        db = sqlite3.connect(AGENT_DB)
+        db.execute(
+            "INSERT OR REPLACE INTO state (key, value, updated_at) "
+            "VALUES (?, ?, ?)",
+            (key, json.dumps(value, ensure_ascii=False),
+             datetime.now(timezone.utc).isoformat()))
+        db.commit()
+        db.close()
+    except Exception as e:
+        log(f"state set {key}: {e}")
+
+
+def _help_text():
+    return (
+        "🤖 <b>Dex — команды</b>\n\n"
+        "<b>Состояние</b>\n"
+        "/status — тик, драйвы, фокус\n"
+        "/last — последние 5 тиков\n"
+        "/drives — любопытство и исполнительность\n"
+        "/memory &lt;запрос&gt; — поиск по 1398 тикам\n\n"
+        "<b>Проверки</b>\n"
+        "/check &lt;name&gt; — disk|backups|updates|services|tools|interest\n"
+        "/skills — список процедур\n"
+        "/skill &lt;имя&gt; — прочитать процедуру\n\n"
+        "<b>Задачи</b>\n"
+        "/tasks — что висит\n"
+        "/task &lt;текст&gt; — завести\n"
+        "/done &lt;id&gt; — закрыть\n\n"
+        "<b>Управление</b>\n"
+        "/tick — форс heartbeat (нужен /yes)\n"
+        "/pause [мин] — выключить Декса (нужен /yes)\n"
+        "/resume — включить обратно\n"
+        "/restart — очистить историю диалога (нужен /yes)\n"
+        "/help — эта справка"
+    )
+
+
+def _run_tick():
+    """Принудительный heartbeat — то же, что /api/action/tick в панели."""
+    try:
+        r = subprocess.run(
+            ["python3", str(BASE_DIR / "heartbeat.py")],
+            capture_output=True, text=True, timeout=90, cwd=str(BASE_DIR))
+        tail = [ln for ln in (r.stdout or "").splitlines() if ln.strip()][-6:]
+        err = (r.stderr or "").strip().splitlines()[-1] if r.stderr and r.stderr.strip() else ""
+        out = "\n".join(tail) or "вывода нет"
+        if err and "Traceback" not in err:
+            out += f"\nstderr: {err[:200]}"
+        return out
+    except subprocess.TimeoutExpired:
+        return "heartbeat не завершился за 90с (возможно, долгий вызов LLM)"
+    except Exception as e:
+        return f"ошибка запуска: {e}"
+
+
+def _do_command(chat_id, cmd, rest):
+    """Исполняет подтверждённую или неопасную команду. Возвращает текст."""
+    import dex_tools as dt
+
+    # --- состояние ---
+    if cmd in ("status", "state"):
+        return "📊 <b>Dex — состояние</b>\n" + read_state_summary(5)
+
+    if cmd == "last":
+        try:
+            with open(TICK_LOG) as f:
+                rows = [json.loads(ln) for ln in f if ln.strip()]
+        except Exception:
+            return "история тиков недоступна"
+        if not rows:
+            return "тиков нет"
+        out = ["<b>Последние тики:</b>"]
+        for t in rows[-5:]:
+            out.append(f"  #{t.get('tick','?')} {str(t.get('ts',''))[5:16]} "
+                       f"{t.get('action','')} → {str(t.get('result',''))[:60]}")
+        return "\n".join(out)
+
+    if cmd == "drives":
+        d = _state_get("drives", {"curiosity": 0.5, "diligence": 0.5})
+        v2 = _state_get("drives_v2", False)
+        try:
+            import heartbeat as hb
+            lo, hi = hb.DRIVE_FLOOR, hb.DRIVE_CEIL
+        except Exception:
+            lo, hi = 0.10, 1.00
+        return (
+            f"🧠 <b>Драйвы</b> (v2={v2})\n"
+            f"  любопытство:     {d.get('curiosity')}\n"
+            f"  исполнительность:{d.get('diligence')}\n"
+            f"  пол/потолок: {lo} / {hi}")
+
+    if cmd == "memory":
+        if not rest:
+            return "формат: /memory &lt;запрос&gt;"
+        res = search_memory(rest, k=5)
+        if not res:
+            return f"По запросу «{rest}» ничего не нашлось."
+        out = [f"🔍 <b>Память</b> — {len(res)} тиков:"]
+        for m in res:
+            out.append(f"  #{m['tick']} {m['ts'][5:16]} {m['action']} → "
+                       f"{m['result'][:70]}")
+        out.append("Это история — данные могли устареть.")
+        return "\n".join(out)
+
+    # --- проверки ---
+    if cmd == "check":
+        name = (rest or "").strip().split()[0] if rest.strip() else ""
+        if not name:
+            return "формат: /check disk|backups|updates|services|tools|interest"
+        return dt.execute_tool("run_check", json.dumps({"name": name}))
+
+    if cmd == "skills":
+        return "<b>Скилы:</b>\n" + dt.skills_index_text()
+
+    if cmd == "skill":
+        if not rest.strip():
+            return "формат: /skill &lt;имя&gt;. Сначала /skills"
+        return dt.execute_tool("read_skill", json.dumps({"name": rest.strip()}))
+
+    # --- задачи ---
+    if cmd == "tasks":
+        return "📋 <b>Задачи</b>\n" + dt.execute_tool(
+            "tasks", json.dumps({"action": "list"}))
+    if cmd == "task":
+        if not rest.strip():
+            return "формат: /task &lt;текст&gt;"
+        return dt.execute_tool("tasks", json.dumps(
+            {"action": "add", "what": rest.strip()}))
+    if cmd == "done":
+        if not rest.strip().isdigit():
+            return "формат: /done &lt;id&gt; — номер из /tasks"
+        return dt.execute_tool("tasks", json.dumps(
+            {"action": "done", "id": int(rest.strip())}))
+
+    # --- управление (сюда попадают только уже подтверждённые) ---
+    if cmd == "tick":
+        return "▶️ <b>Принудительный тик</b>\n" + _run_tick()
+
+    if cmd == "pause":
+        minutes = 0
+        if rest.strip().isdigit():
+            minutes = int(rest.strip())
+        import heartbeat as hb
+        if minutes > 0:
+            until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+            hb.DISABLED_FLAG.write_text(
+                f"paused at {datetime.now(timezone.utc).isoformat()} "
+                f"until={until.isoformat()}")
+            return f"⏸ Dex выключен на {minutes} мин (до {until:%H:%M} UTC). /resume — раньше."
+        hb.DISABLED_FLAG.write_text(
+            f"paused at {datetime.now(timezone.utc).isoformat()}")
+        return "⏸ Dex выключен до /resume."
+
+    if cmd == "resume":
+        import heartbeat as hb
+        if hb.DISABLED_FLAG.exists():
+            hb.DISABLED_FLAG.unlink()
+            return "▶️ Dex снова работает."
+        return "Dex и так работал — флага не было."
+
+    if cmd == "restart":
+        try:
+            db = sqlite3.connect(SESSIONS_DB)
+            n = db.execute("SELECT count(*) FROM sessions WHERE chat_id=?",
+                           (chat_id,)).fetchone()[0]
+            db.execute("DELETE FROM sessions WHERE chat_id=?", (chat_id,))
+            db.commit()
+            db.close()
+        except Exception as e:
+            return f"не смог очистить историю: {e}"
+        return (f"🔄 История очищена (сообщений было: {n}). "
+                "Начинаю с чистого листа — контекст прошлого разговора потерян, "
+                "но состояние сервера и драйвы на месте.")
+
+    return f"неизвестная команда: /{cmd}"
+
+
+def handle_command(chat_id, text):
+    """Диспетчер команд: белый список + подтверждение опасных."""
+    # Повторная проверка здесь же — process_message тоже проверяет, но
+    # защита должна жить в точке входа команд, а не только в вызывающем.
+    if chat_id not in ALLOWED_CHAT_IDS:
+        log(f"Команда отклонена: chat_id {chat_id} не в белом списке")
+        send_message(chat_id, "Это личный бот. Обращение не принято.")
+        return
+
+    parts = text.split(None, 1)
+    token = parts[0]
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    cmd = token.lstrip("/").lower()
+
+    if cmd in ("start", "привет", "help", "хелп", "помощь"):
+        _state_set("pending_cmd", None)
+        send_message(chat_id,
+                     "Привет! Я Dex — смотритель сервера. 🤖\n\n" + _help_text())
+        return
+
+    # подтверждение / отмена
+    if cmd in ("yes", "y", "да", "ок"):
+        p = _state_get("pending_cmd")
+        if not p or p.get("chat_id") != chat_id:
+            send_message(chat_id, "Нет ожидающей команды.")
+            return
+        if time.time() - float(p.get("ts", 0)) > CONFIRM_TTL:
+            _state_set("pending_cmd", None)
+            send_message(chat_id, "Подтверждение устарело (прошло 2 мин). Повтори команду.")
+            return
+        _state_set("pending_cmd", None)
+        send_message(chat_id,
+                     f"✅ Подтверждено: /{p.get('cmd')} — выполняю…\n\n"
+                     + _do_command(chat_id, p.get("cmd", ""), p.get("args", "")))
+        return
+
+    if cmd in ("no", "n", "нет", "отмена"):
+        _state_set("pending_cmd", None)
+        send_message(chat_id, "Отменил.")
+        return
+
+    # опасные команды — спрашиваем
+    if cmd in CONFIRM_CMDS:
+        _state_set("pending_cmd",
+                   {"cmd": cmd, "args": rest, "chat_id": chat_id,
+                    "ts": time.time()})
+        hint = {"pause": "/pause [мин]",
+                "restart": "/restart",
+                "tick": "/tick"}[cmd]
+        send_message(chat_id,
+                     f"⚠️ <b>Подтверди</b>: <code>{hint}</code> "
+                     f"{'с аргументом <code>' + rest + '</code> ' if rest else ''}"
+                     "отправь /yes — выполню, /no — отмена. "
+                     f"Действует {CONFIRM_TTL // 60} мин.")
+        return
+
+    # обычные команды
+    try:
+        out = _do_command(chat_id, cmd, rest)
+    except Exception as e:
+        out = f"ошибка выполнения /{cmd}: {type(e).__name__}: {e}"
+    if out.startswith("неизвестная команда"):
+        out = f"Команда <code>/{cmd}</code> не найдена.\n\n" + _help_text()
+    send_message(chat_id, out)
+
+
 def process_message(msg_data):
     """Обрабатывает одно сообщение: отправляет в Hermes, возвращает ответ"""
     message = msg_data.get("message", {})
@@ -295,15 +564,15 @@ def process_message(msg_data):
         log(f"Пропущено: пустое сообщение (chat_id={chat_id}, text='{text}')")
         return
 
-    # Команды: известные обслуживаем, про неизвестные честно сообщаем
+    # Белый список: личный бот, чужие игнорируем (см. ALLOWED_CHAT_IDS)
+    if chat_id not in ALLOWED_CHAT_IDS:
+        log(f"Отклонено: chat_id {chat_id} не в белом списке")
+        send_message(chat_id, "Это личный бот. Обращение не принято.")
+        return
+
+    # Команды: известные обслуживаем, про неизвестные подсказываем /help
     if text.startswith("/"):
-        cmd = text.split()[0].lower()
-        if cmd == "/start":
-            send_message(chat_id, "Привет! Я Dex — смотритель сервера. Можешь спросить меня о состоянии сервера или просто поболтать 🤖")
-        elif cmd in ("/status", "/state"):
-            send_message(chat_id, "📊 <b>Dex — состояние</b>\n" + read_state_summary(5))
-        else:
-            send_message(chat_id, f"Команда <code>{cmd}</code> пока не реализована. Есть /start и /status.")
+        handle_command(chat_id, text)
         return
 
     log(f"Сообщение от {chat_id}: {text[:100]}")

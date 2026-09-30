@@ -176,6 +176,19 @@ TOOLS = [
         },
     },
     {
+        "name": "tasks",
+        "description": "Твои задачи. add — когда заметил проблему, которую сам не можешь устранить (песочница только читает); list — что висит; done — закрыть по номеру.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["list", "add", "done"]},
+                "what": {"type": "string", "description": "Текст задачи, только для action=add"},
+                "id": {"type": "integer", "description": "Номер задачи, только для action=done"}
+            },
+            "required": ["action"],
+        },
+    },
+    {
         "name": "tail_log",
         "description": "Прочитать последние строки файла (журнал, лог, JSONL).",
         "parameters": {
@@ -299,6 +312,45 @@ def tool_run_check(name):
     return _clip(dispatch[name]())
 
 
+def tool_tasks(action, what=None, id=None):
+    """Задачи Dex: list — открыть, add — завести, done — закрыть."""
+    import heartbeat as hb
+    db = sqlite3.connect(str(hb.DB_PATH))
+    try:
+        action = str(action or "").strip().lower()
+        if action == "list":
+            rows = hb.task_list(db, "pending", 15)
+            if not rows:
+                out = "открытых задач нет"
+                done = hb.task_list(db, "done", 5)
+                if done:
+                    out += "\nнедавно закрытые:"
+                    out += "\n".join(f"  #{r['id']} {r['what'][:80]}"
+                                      for r in done)
+                return out
+            body = "\n".join(
+                f"  #{r['id']} [{r['source']}] {r['what'][:90]}" for r in rows)
+            return f"открытых задач: {len(rows)}\n{body}"
+        if action == "add":
+            text = str(what or "").strip()
+            if not text:
+                return "нужен текст задачи — параметр what"
+            tid = hb.task_add(db, text, source="dex", result="создано из чата")
+            return f"задача #{tid} создана" if tid else "такая задача уже открыта"
+        if action == "done":
+            if id is None or str(id).strip() == "":
+                return "нужен номер задачи — параметр id"
+            try:
+                tid = int(id)
+            except (TypeError, ValueError):
+                return f"id должен быть числом, получено: {id}"
+            return (f"задача #{tid} закрыта" if hb.task_done(db, tid)
+                    else f"задача #{tid} не найдена или уже закрыта")
+        return "action: list | add | done"
+    finally:
+        db.close()
+
+
 DISPATCH = {
     "read_file": tool_read_file,
     "list_dir": tool_list_dir,
@@ -307,6 +359,7 @@ DISPATCH = {
     "run_check": tool_run_check,
     "list_skills": lambda **_: tool_list_skills(),
     "read_skill": tool_read_skill,
+    "tasks": tool_tasks,
 }
 
 

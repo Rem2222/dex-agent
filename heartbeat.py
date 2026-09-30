@@ -6,6 +6,7 @@ Dex Heartbeat — проактивный тик агента
 """
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -281,11 +282,146 @@ def migrate_drives(db, drives):
     return fresh
 
 # === MAIN ===
+# === ЗАДАЧИ ===
+# Таблица была создана, но никто ей не пользовался (0 строк). Теперь это
+# список дел, которые Dex заметил, но сам не может сделать: песочница
+# разрешает только чтение, лечить может только Ром.
+
+
+def _db_rows(db, sql, args=()):
+    db.row_factory = sqlite3.Row
+    return [dict(r) for r in db.execute(sql, args).fetchall()]
+
+
+def task_add(db, what, source="heartbeat", result=None):
+    """Открывает задачу. Дедупликация: такая же pending не плодится —
+    иначе check_services завёл бы одну и ту же 20 раз подряд."""
+    what = str(what or "").strip()
+    if not what:
+        return None
+    row = db.execute(
+        "SELECT id FROM tasks WHERE what=? AND status='pending' LIMIT 1",
+        (what,)).fetchone()
+    if row:
+        return int(row[0])
+    cur = db.execute(
+        "INSERT INTO tasks(what, status, source, result, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (what, "pending", source, result,
+         datetime.now(timezone.utc).isoformat()))
+    db.commit()
+    return int(cur.lastrowid)
+
+
+def task_list(db, status="pending", limit=20):
+    """Задачи как список dict: id, what, source, created_at, done_at."""
+    return _db_rows(
+        db,
+        "SELECT id, what, status, source, result, created_at, done_at "
+        "FROM tasks WHERE status=? ORDER BY id DESC LIMIT ?",
+        (status, limit))
+
+
+def task_done(db, task_id):
+    """Закрывает задачу. Возвращает True, если нашли."""
+    row = db.execute("SELECT id FROM tasks WHERE id=? AND status='pending'",
+                     (task_id,)).fetchone()
+    if not row:
+        return False
+    db.execute("UPDATE tasks SET status='done', done_at=?, result=? "
+               "WHERE id=?",
+               (datetime.now(timezone.utc).isoformat(),
+                "закрыто вручную", task_id))
+    db.commit()
+    return True
+
+
+def task_stats(db):
+    """{"pending": N, "done": M, "oldest_hours": H|None}."""
+    try:
+        p = db.execute(
+            "SELECT count(*) FROM tasks WHERE status='pending'").fetchone()[0]
+        d = db.execute(
+            "SELECT count(*) FROM tasks WHERE status='done'").fetchone()[0]
+        row = db.execute(
+            "SELECT min(created_at) FROM tasks WHERE status='pending'"
+        ).fetchone()[0]
+    except sqlite3.Error:
+        return {"pending": 0, "done": 0, "oldest_hours": None}
+    oldest = None
+    if row:
+        try:
+            ts = datetime.fromisoformat(row)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            oldest = round((datetime.now(timezone.utc) - ts).total_seconds() / 3600, 1)
+        except Exception:
+            pass
+    return {"pending": p, "done": d, "oldest_hours": oldest}
+
+
+def maybe_file_task(db, decision, result):
+    """Что-то заметили, а чинить нельзя — кладём задачу Рома.
+
+    ВАЖНО: в `what` — только СТАБИЛЬНАЯ фраза, детали в `result`.
+    Иначе дедупликация не работает: список неактивных юнитов меняется
+    от тика к тику, и одна и та же проблема плодила бы задачи (#2 и #7).
+    """
+    text = str(result or "")
+    try:
+        if decision == "check_services" and "НЕ активны" in text:
+            m = re.search(r"НЕ активны \d+ — (.+?)(?:;|$)", text)
+            detail = m.group(1).strip() if m else text
+            return task_add(db, "разобраться с неактивными сервисами",
+                            "heartbeat", detail)
+        if decision == "check_disk":
+            m = re.search(r"\((\d+)% занято\)", text)
+            if m and int(m.group(1)) >= 90:
+                return task_add(db, "нехватка места на диске",
+                                "heartbeat", f"{m.group(1)}% занято; {text}")
+        if decision == "check_backups" and "нет файлов бэкапов" in text:
+            return task_add(db, "бэкапы не найдены — проверить pg-backup",
+                            "heartbeat", text)
+    except sqlite3.Error:
+        return None
+    return None
+
+
+def _disable_expired():
+    """Снимает DISABLED, если истекла отложенная пауза (/pause 30).
+
+    В файле лежит 'until=<ISO>'. Флажок без until ведёт себя как раньше —
+    вечно, пока не пришлют /resume.
+    """
+    try:
+        txt = DISABLED_FLAG.read_text()
+    except OSError:
+        return False
+    if "until=" not in txt:
+        return False
+    try:
+        until = datetime.fromisoformat(txt.split("until=", 1)[1].strip())
+    except Exception:
+        return False
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) >= until:
+        try:
+            DISABLED_FLAG.unlink()
+        except OSError:
+            return False
+        return True
+    return False
+
+
 def main():
     # 1. Красная кнопка
     if DISABLED_FLAG.exists():
-        log("Dex спит (DISABLED флаг найден)")
-        return
+        if _disable_expired():
+            log("Пауза истекла — снял DISABLED, продолжаю")
+        else:
+            log("Dex спит (DISABLED флаг найден)")
+            return
 
     log("=== Dex Heartbeat ===")
 
@@ -327,6 +463,19 @@ def main():
             "выбери одну из обязанностей в списке «Пора проверить».")
     if duty_due:
         prompt_parts.append(f"Пора проверить: {', '.join(duty_due)}")
+    # Открытые задачи: влияют и на выбор, и на исполнительность.
+    # Просрочка старше суток копит драйв — потребность не насыщена.
+    tstats = task_stats(db)
+    if tstats["pending"]:
+        prompt_parts.append(
+            f"Открытых задач: {tstats['pending']} (старшая — "
+            f"{tstats['oldest_hours']}ч). Если ничего не срочно, можно "
+            "взяться за одну — выбери check_services или check_disk.")
+        if (tstats["oldest_hours"] or 0) >= 24:
+            drives["diligence"] = round(min(
+                DRIVE_CEIL,
+                drives.get("diligence", 0.5) + DRIVE_STEP_OVERDUE), 2)
+            set_state(db, "drives", drives)
     if history:
         prompt_parts.append("Последние тики:")
         for h in history:
@@ -381,6 +530,9 @@ def main():
         result = execute_explore_interest(identity, db)
     else:
         result = f"неизвестная команда: {decision}"
+
+    # Замеченное, но неисправимое — в задачи (дедуп по тексту)
+    maybe_file_task(db, decision, result)
 
     # 7. Логируем результат
     log(f"Результат: {result}")
