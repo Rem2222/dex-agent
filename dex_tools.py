@@ -12,6 +12,7 @@ Dex работает от root, поэтому доступ строго огр�
 OpenAI — см. chat_with_tools() в dex_poller.py.
 """
 import json
+import sqlite3
 from pathlib import Path
 
 # === ПЕСОНИЦА ===
@@ -48,8 +49,8 @@ TOOLS = [
             "properties": {
                 "name": {
                     "type": "string",
-                    "enum": ["backups", "updates", "disk", "services", "tools"],
-                    "description": "Какой чек выполнить: backups=свежесть бэкапов, updates=доступные обновления apt, disk=свободное место, services=состояние сервисов, tools=поиск новых инструментов",
+                    "enum": ["backups", "updates", "disk", "services", "tools", "interest"],
+                    "description": "Какой чек выполнить: backups=свежесть бэкапов, updates=доступные обновления apt, disk=свободное место, services=состояние сервисов из реестра, tools=новые скрипты, interest=исследовать одну из тем своих интересов",
                 }
             },
             "required": ["name"],
@@ -195,6 +196,8 @@ def tool_run_check(name):
         "disk": lambda: hb.execute_check_disk(),
         "services": lambda: hb.execute_check_services(),
         "tools": lambda: hb.execute_check_tools(),
+        "interest": lambda: hb.execute_explore_interest(
+            hb.load_identity(), sqlite3.connect(str(hb.DB_PATH))),
     }
     if name not in dispatch:
         return "неизвестный чек: " + name + ". Доступны: " + ", ".join(dispatch)

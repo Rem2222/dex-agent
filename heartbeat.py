@@ -544,51 +544,234 @@ def execute_check_disk():
     except Exception as e:
         return f"ошибка: {e}"
 
-def execute_check_tools():
+def _script_snapshot():
+    """Имена исполняемых скриптов в каталогах, где живут инструменты."""
+    now = {}
+    for d in (Path("/usr/local/bin"), Path("/root/.hermes/scripts")):
+        if not d.exists():
+            continue
+        for f in d.iterdir():
+            if f.is_file() and os.access(f, os.X_OK):
+                now[str(f)] = int(f.stat().st_mtime)
+    return now
+
+
+def execute_check_tools(db=None):
+    """Реальный поиск новых инструментов: diff снимка скриптов с прошлым тиком.
+
+    Раньше была заглушка («поиск инструментов запланирован, пропускаю этот
+    тик») — тик расходовался впустую 6 раз за день.
+    """
     log("Ищу новые инструменты...")
-    # Пока заглушка — в следующей версии будет реальный поиск
-    return "поиск инструментов запланирован, пропускаю этот тик"
+    now = _script_snapshot()
+    if not now:
+        return "каталоги скриптов не найдены"
+
+    own = db is not None
+    if not own:
+        db = sqlite3.connect(DB_PATH)
+    try:
+        prev = get_state(db, "tools_snapshot", {})
+        if not prev:
+            set_state(db, "tools_snapshot", now)
+            return f"базовый снимок: {len(now)} скриптов, начинаю отслеживать"
+
+        added = sorted(k for k in now if k not in prev)
+        removed = sorted(k for k in prev if k not in now)
+        updated = sorted(k for k in now if k in prev and now[k] != prev[k])
+        set_state(db, "tools_snapshot", now)
+    finally:
+        if not own:
+            db.close()
+
+    if not (added or removed or updated):
+        return f"скриптов: {len(now)}, изменений с прошлого раза нет"
+
+    parts = []
+    if added:
+        parts.append("новые: " + ", ".join(Path(k).name for k in added[:8]))
+    if removed:
+        parts.append("убраны: " + ", ".join(Path(k).name for k in removed[:8]))
+    if updated:
+        parts.append("изменены: " + ", ".join(Path(k).name for k in updated[:8]))
+    return f"всего {len(now)} скриптов. " + "; ".join(parts)
+
+
+def _registry_units():
+    """Считывает systemd_units со всех страниц реестра сервисов в вики."""
+    import re
+    reg = Path.home() / "Documents" / "wiki" / "ops" / "services"
+    units, pages = set(), 0
+    if not reg.exists():
+        return pages, sorted(units)
+    for md in reg.glob("*.md"):
+        pages += 1
+        try:
+            txt = md.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        # инлайн-вид:  systemd_units: [freeqwenapi, dex-control]
+        for m in re.finditer(r"systemd_units:\s*\[([^\]]*)\]", txt):
+            for u in m.group(1).split(","):
+                u = u.strip().strip("'\"")
+                if u:
+                    units.add(u)
+        # блочный вид:  systemd_units:\n    - dex-poller.service
+        for m in re.finditer(r"systemd_units:\s*\n((?:\s*-\s*\S+\s*\n)+)", txt):
+            for line in m.group(1).splitlines():
+                u = line.strip().lstrip("-").strip()
+                if u:
+                    units.add(u)
+    return pages, sorted(units)
+
+
+def _user_unit_names():
+    """Имена unit-файлов, известных пользовательскому менеджеру systemd."""
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "list-unit-files", "--no-legend",
+             "--plain", "--no-pager"],
+            capture_output=True, text=True, timeout=15
+        ).stdout
+    except Exception:
+        return set()
+    return {ln.split()[0] for ln in out.splitlines() if ln.strip()}
+
+
+def _unit_states(units):
+    """-> {юнит: состояние}. Пользовательские юниты проверяем через --user.
+
+    Без этого dex-poller и dex-control числились «inactive», хотя работают:
+    они установлены в менеджере сеанса, а не в системном.
+    """
+    user_files = _user_unit_names()
+
+    def is_user(u):
+        return u in user_files or u + ".service" in user_files
+
+    states = {}
+    for flag, group in ((["--user"], [u for u in units if is_user(u)]),
+                        ([], [u for u in units if not is_user(u)])):
+        if not group:
+            continue
+        r = subprocess.run(["systemctl", *flag, "is-active", *group],
+                           capture_output=True, text=True, timeout=30)
+        vals = [ln.strip() for ln in r.stdout.splitlines()]
+        if len(vals) != len(group):
+            # ответ неполный — по одному, чтобы не приписать чужое состояние
+            vals = []
+            for u in group:
+                q = subprocess.run(["systemctl", *flag, "is-active", u],
+                                   capture_output=True, text=True, timeout=5)
+                vals.append(q.stdout.strip())
+        for u, st in zip(group, vals):
+            states[u] = (st or "unknown").strip()
+    return states
+
 
 def execute_check_services():
-    log("Проверяю сервисы...")
+    """Проверяет ВСЕ сервисы из реестра вики, а не один юнит.
+
+    Раньше проверял только `is-active dex-poller` и число контейнеров,
+    то есть 1 сервис из 41.
+    """
+    log("Проверяю сервисы по реестру вики...")
     try:
-        result = subprocess.run(
-            ["systemctl", "--user", "is-active", "dex-poller.service"],
-            capture_output=True, text=True, timeout=5
-        )
-        dex_poller = result.stdout.strip()
-        # Проверяем критичные Docker-сервисы
-        docker_result = subprocess.run(
-            ["docker", "ps", "--format", "{{.Names}}"],
-            capture_output=True, text=True, timeout=10
-        )
-        containers = [l.strip() for l in docker_result.stdout.splitlines() if l.strip()]
-        return f"Dex Poller: {dex_poller}, контейнеров: {len(containers)}"
+        pages, units = _registry_units()
+        if not units:
+            return f"реестр: {pages} страниц, systemd_units не найдены"
+
+        states = _unit_states(units)
+        ok, bad = [], []
+        for u in units:
+            st = states.get(u, "unknown")
+            if st in ("active", "activating", "reloading"):
+                ok.append(u)
+            else:
+                bad.append(f"{u}={st}")
+
+        try:
+            d = subprocess.run(["docker", "ps", "-a", "--format",
+                                "{{.Names}}\t{{.Status}}"],
+                               capture_output=True, text=True, timeout=15)
+            rows = [ln.split("\t") for ln in d.stdout.splitlines() if ln.strip()]
+            containers = len(rows)
+            down = [r0[0] for r0 in rows
+                    if len(r0) > 1 and not r0[1].lower().startswith("up")]
+        except Exception:
+            containers, down = -1, []
+
+        base = f"реестр: {pages} стр., юнитов {len(units)}: активны {len(ok)}"
+        if bad:
+            base += f", НЕ активны {len(bad)} — " + ", ".join(bad[:6])
+        if containers >= 0:
+            base += (f"; docker: {containers} "
+                     f"(не запущены: {', '.join(down[:6]) or 'нет'})")
+        return base
     except Exception as e:
-        return f"ошибка проверки сервисов: {e}"
+        return f"ошибка проверки сервисов: {type(e).__name__}: {e}"
+
 
 def execute_explore_interest(identity, db):
-    interests = identity.get("interests", [])
-    if not interests:
-        return "нет интересов для изучения"
-    # Нормализуем: интересы могут быть строками или dict (из YAML)
-    flat_interests = []
+    """Реальное исследование: LLM даёт короткое наблюдение по теме.
+
+    Раньше была заглушка — ставила timestamp и возвращала «посмотрю что
+    нового в: ...», ничего не изучая.
+    """
+    interests = (identity or {}).get("interests", []) or []
+    flat = []
     for item in interests:
         if isinstance(item, dict):
-            flat_interests.extend(item.values())
+            flat.extend(str(v) for v in item.values() if v)
         else:
-            flat_interests.append(str(item))
-    flat_interests = [i for i in flat_interests if i]
-    if not flat_interests:
+            flat.append(str(item))
+    flat = [i for i in flat if i]
+    if not flat:
         return "нет интересов для изучения"
-    import random
-    interest = random.choice(flat_interests)
-    last_explored = get_state(db, "last_explored_interest", {})
-    last_explored[interest] = datetime.now(timezone.utc).isoformat()
-    set_state(db, "last_explored_interest", last_explored)
+
+    # круговой выбор, а не случайный: иначе часть тем никогда не выпадет
+    cursor = int(get_state(db, "explore_cursor", 0)) % len(flat)
+    interest = flat[cursor]
+    set_state(db, "explore_cursor", (cursor + 1) % len(flat))
+
     log(f"Изучаю: {interest}")
-    # Пока заглушка — будет дёргать LLM для анализа
-    return f"посмотрю что нового в: {interest}"
+    prompt = (
+        f"Тема для исследования: {interest}\n"
+        "Контекст: я — Dex, смотритель VPS. На сервере работают Hermes, "
+        "Dex, Multica, OpenViking с векторной памятью, есть вики на markdown.\n"
+        "Дай ОДНО конкретное наблюдение, мысль или вопрос по этой теме, "
+        "который стоит проверить в первую очередь. 1-2 предложения, по-русски, "
+        "без общих слов."
+    )
+    note = call_llm(
+        "Ты — любопытный серверный помощник Dex. Отвечаешь по-русски, "
+        "коротко и конкретно, без иероглифов и без воды.",
+        prompt,
+        max_tokens=250,
+        db=db,
+    )
+    if not note or not str(note).strip():
+        note = "LLM недоступна — наблюдение не получено"
+    note = str(note).strip().replace("\n", " ")[:300]
+
+    history = get_state(db, "explorations", [])
+    if not isinstance(history, list):
+        history = []
+    history.append({
+        "interest": interest,
+        "note": note,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    })
+    set_state(db, "explorations", history[-20:])
+
+    last = get_state(db, "last_explored_interest", {})
+    if not isinstance(last, dict):
+        last = {}
+    last[interest] = datetime.now(timezone.utc).isoformat()
+    set_state(db, "last_explored_interest", last)
+
+    return f"{interest}: {note[:200]}"
+
 
 if __name__ == "__main__":
     main()
