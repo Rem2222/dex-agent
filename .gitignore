@@ -16,3 +16,10 @@ __pycache__/
 *.pyc
 .DS_Store
 venv/
+
+# Резервные копии кода перед правками (не коммитим)
+*.bak-*
+
+# Локальные состояния
+DISABLED
+.poller_offset
