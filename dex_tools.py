@@ -14,7 +14,9 @@ OpenAI — см. chat_with_tools() в dex_poller.py.
 import json
 import os
 import re
+import shutil
 import sqlite3
+import tempfile
 from pathlib import Path
 
 # === ПЕСОНИЦА ===
@@ -212,6 +214,31 @@ TOOLS = [
                 }
             },
             "required": ["template"],
+        },
+    },
+    {
+        "name": "write_file",
+        "description": "Записать файл. Уровень 2: только sandbox/ и skills/. Уровень 1: весь /root/.hermes. Уровень 3: отключено.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Абсолютный путь"},
+                "content": {"type": "string", "description": "Содержимое файла целиком"}
+            },
+            "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "run_script",
+        "description": "Запустить свой Python-скрипт из sandbox. Уровень 2: от пользователя, без сети, с лимитами. Уровень 1: от root. Уровень 3: отключено.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Имя .py в sandbox, например parse_log.py"},
+                "inputs": {"type": "array", "items": {"type": "string"},
+                           "description": "Файлы-входы: будут скопированы в sandbox/_in и доступны скрипту"}
+            },
+            "required": ["name"],
         },
     },
     {
@@ -512,6 +539,245 @@ def tool_run_cmd(template, args=None):
     return _clip(head + "\n" + body.strip())
 
 
+# === УРОВНИ ДОСТУПА ===
+# 3 — только чтение (по умолчанию, «как сейчас»)
+# 2 — песочница: запись в sandbox/skills, запуск от nobody без сети
+# 1 — root: запись по /root/.hermes, запуск от root
+SANDBOX_DIR = SKILLS_DIR.parent / "sandbox"
+NOBODY_UID = NOBODY_GID = 65534
+SCRIPT_TIMEOUT = 20
+SCRIPT_MAX_BYTES = 100 * 1024          # что можно записать одним махом
+TOOL_LEVELS = {"write_file": (1, 2), "run_script": (1, 2)}
+WRITE_ROOTS = {
+    2: (SANDBOX_DIR, SKILLS_DIR),
+    1: (Path("/root/.hermes"),),
+}
+LEVEL_NAMES = {1: "root", 2: "песочница", 3: "только чтение"}
+_AGENT_DB = Path(__file__).resolve().parent / "agent.db"
+
+
+def get_access_level():
+    """Текущий уровень. 3 = самый закрытый, 1 = root. Ошибка -> 3."""
+    try:
+        db = sqlite3.connect(str(_AGENT_DB))
+        row = db.execute("SELECT value FROM state WHERE key='access_level'").fetchone()
+        db.close()
+        if row:
+            lv = int(json.loads(row[0]))
+            if lv in (1, 2, 3):
+                return lv
+    except Exception:
+        pass
+    return 3
+
+
+def set_access_level(lv):
+    db = sqlite3.connect(str(_AGENT_DB))
+    db.execute("INSERT OR REPLACE INTO state (key, value, updated_at) "
+               "VALUES (?, ?, ?)",
+               ("access_level", json.dumps(int(lv)),
+                __import__("datetime").datetime.now(
+                    __import__("datetime").timezone.utc).isoformat()))
+    db.commit()
+    db.close()
+
+
+def active_tools(level=None):
+    """Схемы, доступные на текущем уровне. L3 не видит write/run."""
+    level = get_access_level() if level is None else level
+    out = []
+    for t in TOOLS:
+        allowed = TOOL_LEVELS.get(t["name"], (1, 2, 3))
+        if level in allowed:
+            out.append(t)
+    return out
+
+
+def _write_roots(level):
+    return WRITE_ROOTS.get(level, ())
+
+
+def tool_write_file(path, content):
+    """Запись файла. Разрешена только внутри каталогов своего уровня."""
+    level = get_access_level()
+    if level == 3:
+        return ("уровень доступа 3 — запись запрещена. "
+                "Переключение: /access 2 (песочница) или /access 1 (root).")
+    if content is None:
+        return "нет содержимого (параметр content)"
+    content = str(content)
+    if len(content.encode()) > SCRIPT_MAX_BYTES:
+        return f"слишком большой файл: {len(content.encode())} > {SCRIPT_MAX_BYTES} байт"
+
+    try:
+        p = Path(str(path).strip()).resolve()
+    except Exception as e:
+        return f"не разобрал путь: {e}"
+    low = str(p).lower()
+    for deny in DENY_SUBSTRINGS:
+        if deny in low:
+            return f"отказано: доступ к '{deny}' закрыт"
+    if p.suffix in (".db", ".sqlite", ".sqlite3"):
+        return "отказано: базы данных писать нельзя (для них есть свои инструменты)"
+
+    roots = _write_roots(level)
+    if not any(str(p) == str(r) or str(p).startswith(str(r) + "/") for r in roots):
+        return ("отказано: путь вне зоны записи уровня "
+                f"{level} ({LEVEL_NAMES[level]}). Разрешено: "
+                + ", ".join(str(r) for r in roots))
+
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+    except Exception as e:
+        return f"не смог записать: {type(e).__name__}: {e}"
+    lines = content.count("\n") + 1
+    return f"записано: {p} ({len(content.encode())} байт, {lines} строк)"
+
+
+def _sandbox_limits():
+    """Лимиты процесса: CPU, память, размер файла, дескрипторы, core."""
+    import resource
+    resource.setrlimit(resource.RLIMIT_CPU, (SCRIPT_TIMEOUT, SCRIPT_TIMEOUT))
+    resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (10 << 20, 10 << 20))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+
+def tool_run_script(name, inputs=None):
+    """Запуск своего скрипта из sandbox.
+
+    Уровень 2: от nobody (65534), без сети (unshare --net), с лимитами.
+      ВАЖНО: nobody не пройдёт через /root (права 0700), поэтому скрипт
+      и входные файлы копируются во временный каталог 0755 в /tmp,
+      а после запуска удаляются — артефакты остаются только в stdout.
+    Уровень 1: от root, в своём sandbox, сеть есть, артефакты сохраняются.
+    Уровень 3: запрещено.
+    """
+    import subprocess
+    level = get_access_level()
+    if level == 3:
+        return ("уровень доступа 3 — запуск запрещён. "
+                "Переключение: /access 2 (песочница) или /access 1 (root).")
+
+    name = str(name or "").strip()
+    if not name.endswith(".py"):
+        name += ".py"
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,60}\.py", name):
+        return f"недопустимое имя скрипта: {name!r}"
+    try:
+        script = (SANDBOX_DIR / name).resolve()
+    except Exception as e:
+        return f"не разобрал путь: {e}"
+    if not str(script).startswith(str(SANDBOX_DIR.resolve()) + "/"):
+        return "отказано песочницей: скрипт вне sandbox"
+    if not script.is_file():
+        return f"скрипт '{name}' не найден. Сначала write_file в {SANDBOX_DIR}"
+
+    # входные файлы — только из read-allowlist
+    in_files = []
+    if inputs:
+        if isinstance(inputs, str):
+            inputs = [inputs]
+        for raw in list(inputs)[:5]:
+            try:
+                src = safe_path(raw)
+            except SandboxError as e:
+                return f"входной файл отклонён: {e}"
+            if not src.is_file():
+                return f"входной файл не найден: {src}"
+            in_files.append(src)
+
+    workdir = None
+    try:
+        if level == 1:
+            # root: запускаем там же, рядом со скриптом — артефакты живут
+            workdir = SANDBOX_DIR
+            run_path = script
+            in_dir = SANDBOX_DIR / "_in"
+            argv = ["/usr/bin/python3", "-I", str(run_path)]
+            who, net = "root", "сеть разрешена"
+        else:
+            # nobody: отдельный каталог, куда ему разрешён проход
+            workdir = Path(tempfile.mkdtemp(prefix="dexrun_", dir="/tmp"))
+            workdir.chmod(0o777)  # nobody может писать результат; каталог одноразовый
+            run_path = workdir / script.name
+            shutil.copy2(script, run_path)
+            run_path.chmod(0o644)
+            in_dir = workdir / "_in"
+            argv = ["/usr/bin/unshare", "--net",
+                    f"--setuid={NOBODY_UID}", f"--setgid={NOBODY_GID}",
+                    "--", "/usr/bin/python3", "-I", str(run_path)]
+            who, net = "nobody (65534)", "сеть отрезана (unshare --net)"
+
+        copied = []
+        if in_files:
+            in_dir.mkdir(parents=True, exist_ok=True)
+            in_dir.chmod(0o755)
+            for src in in_files:
+                dst = in_dir / re.sub(r"[^A-Za-z0-9._-]", "_", src.name)
+                shutil.copy2(src, dst)
+                dst.chmod(0o644)
+                copied.append(dst.name)
+
+        env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+               "HOME": str(workdir),
+               "TMPDIR": "/tmp",
+               "DEX_INPUT_DIR": str(in_dir),
+               "PYTHONDONTWRITEBYTECODE": "1"}
+
+        def _pre():
+            _sandbox_limits()
+            os.setsid()
+
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True,
+                               timeout=SCRIPT_TIMEOUT, cwd=str(workdir),
+                               env=env, preexec_fn=_pre)
+        except subprocess.TimeoutExpired:
+            return f"таймаут {SCRIPT_TIMEOUT}с — скрипт убит (лимит CPU)"
+        except PermissionError:
+            return "не смог запустить: прав не хватило (unshare/setuid)"
+        except Exception as e:
+            return f"ошибка запуска: {type(e).__name__}: {e}"
+
+        # забираем то, что скрипт создал рядом с собой
+        saved = []
+        if level == 2 and workdir is not None and workdir.is_dir():
+            for f in sorted(workdir.iterdir()):
+                if f.name in ("_in", script.name) or f.name == "__pycache__":
+                    continue
+                if not f.is_file():
+                    continue
+                try:
+                    if f.stat().st_size > SCRIPT_MAX_BYTES:
+                        saved.append(f"{f.name}: слишком большой, пропущен")
+                        continue
+                    dst = SANDBOX_DIR / f.name
+                    shutil.copy2(f, dst)
+                    dst.chmod(0o644)
+                    saved.append(f"{f.name} ({f.stat().st_size} байт)")
+                except Exception as e:
+                    saved.append(f"{f.name}: не забрал ({e})")
+
+        out = (r.stdout or "").strip()
+        err = (r.stderr or "").strip()
+        head = (f"$ {name}  →  код {r.returncode}  |  {who}, {net}"
+                + (f"  |  входные файлы: {', '.join(copied)}" if copied else ""))
+        if level == 2:
+            if saved:
+                head += "\nсохранено в sandbox: " + "; ".join(saved)
+            else:
+                head += "  |  новых файлов нет"
+        body = out
+        if err:
+            body = (body + "\n\nSTDERR:\n" + err) if body else ("STDERR:\n" + err)
+        return _clip(head + ("\n" + body if body else "\n(скрипт ничего не вывел)"))
+    finally:
+        if level == 2 and workdir is not None:
+            shutil.rmtree(workdir, ignore_errors=True)
+
 def tool_tasks(action, what=None, id=None):
     """Задачи Dex: list — открыть, add — завести, done — закрыть."""
     import heartbeat as hb
@@ -561,6 +827,8 @@ DISPATCH = {
     "read_skill": tool_read_skill,
     "tasks": tool_tasks,
     "run_cmd": tool_run_cmd,
+    "write_file": tool_write_file,
+    "run_script": tool_run_script,
 }
 
 

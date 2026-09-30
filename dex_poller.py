@@ -19,7 +19,9 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from dex_tools import TOOLS, execute_tool, skills_index_text
+from dex_tools import (TOOLS, execute_tool, skills_index_text,
+                        get_access_level, set_access_level,
+                        active_tools, LEVEL_NAMES, SANDBOX_DIR)
 
 # === CONFIG ===
 BASE_DIR = Path.home() / ".hermes" / "proactive"
@@ -39,7 +41,7 @@ DISABLED_FLAG = BASE_DIR / "DISABLED"
 # Раньше chat_id не проверялся вовсе — бота мог завести кто угодно.
 ALLOWED_CHAT_IDS = {386235337}
 # Команды, которым нужно подтверждение /yes
-CONFIRM_CMDS = {"pause", "restart", "tick"}
+CONFIRM_CMDS = {"pause", "restart", "tick", "access"}
 CONFIRM_TTL = 120  # секунд живёт ожидающая команда
 
 
@@ -308,6 +310,24 @@ def _state_get(key, default=None):
         return default
 
 
+def _access_text():
+    """Что сейчас разрешено на текущем уровне."""
+    lv = get_access_level()
+    rows = {
+        3: "3 — только чтение (как было до 30.09): 9 инструментов, "
+           "записи и запуска нет.",
+        2: "2 — песочница: + запись в sandbox/ и skills/, "
+           "+ запуск своих .py от пользователя nobody, БЕЗ сети, "
+           "с лимитами (CPU 20с, память 1 ГБ, файл 10 МБ).",
+        1: "1 — root: + запись по всему /root/.hermes, "
+           "+ запуск от root со счётом. Самый опасный уровень.",
+    }
+    lines = ["🔒 <b>Уровень доступа</b>", rows.get(lv, str(lv)),
+             "", "Переключение: /access 1 | /access 2 | /access 3 "
+                 "(нужен /yes, кроме перехода на 3)."]
+    return "\n".join(lines)
+
+
 def _state_set(key, value):
     try:
         db = sqlite3.connect(AGENT_DB)
@@ -343,6 +363,7 @@ def _help_text():
         "/pause [мин] — выключить Декса (нужен /yes)\n"
         "/resume — включить обратно\n"
         "/restart — очистить историю диалога (нужен /yes)\n"
+        "/access [1|2|3] — уровень доступа (запрос/переключение)\n"
         "/help — эта справка"
     )
 
@@ -430,6 +451,17 @@ def _do_command(chat_id, cmd, rest):
         return dt.execute_tool("read_skill", json.dumps({"name": rest.strip()}))
 
     # --- задачи ---
+    if cmd == "access":
+        raw = (rest or "").strip().split()[0] if rest.strip() else ""
+        if raw not in ("1", "2", "3"):
+            return ("формат: /access 1|2|3. Сейчас уровень "
+                    f"{get_access_level()} ({LEVEL_NAMES[get_access_level()]}).")
+        lv = int(raw)
+        old_lv = get_access_level()
+        set_access_level(lv)
+        return (_access_text() + f"\n\nБыло: {old_lv} "
+                f"({LEVEL_NAMES[old_lv]}) → стало: {lv}.")
+
     if cmd == "tasks":
         return "📋 <b>Задачи</b>\n" + dt.execute_tool(
             "tasks", json.dumps({"action": "list"}))
@@ -501,6 +533,16 @@ def handle_command(chat_id, text):
     rest = parts[1].strip() if len(parts) > 1 else ""
     cmd = token.lstrip("/").lower()
 
+    # «посмотреть уровень» — без подтверждения; «переключить» — с ним
+    if cmd == "access" and not rest.strip():
+        send_message(chat_id, _access_text())
+        return
+
+    # переход НА 3 — безопасное направление, спрашивать незачем
+    if cmd == "access" and rest.strip() == "3":
+        send_message(chat_id, _do_command(chat_id, "access", "3"))
+        return
+
     if cmd in ("start", "привет", "help", "хелп", "помощь"):
         _state_set("pending_cmd", None)
         send_message(chat_id,
@@ -535,7 +577,7 @@ def handle_command(chat_id, text):
                     "ts": time.time()})
         hint = {"pause": "/pause [мин]",
                 "restart": "/restart",
-                "tick": "/tick"}[cmd]
+                "tick": "/tick"}.get(cmd, f"/{cmd}")
         send_message(chat_id,
                      f"⚠️ <b>Подтверди</b>: <code>{hint}</code> "
                      f"{'с аргументом <code>' + rest + '</code> ' if rest else ''}"
@@ -600,6 +642,15 @@ def process_message(msg_data):
 
     # Скилы: короткий индекс, чтобы Dex знал про процедуры,
     # а сам текст читал через инструмент read_skill.
+    lv = get_access_level()
+    if lv < 3:
+        system_prompt += (
+            f"\n\nУровень доступа: {lv} ({LEVEL_NAMES[lv]}). "
+            "Доступны write_file и run_script — свои скрипты кладёшь "
+            f"в {SANDBOX_DIR} и запускаешь их. На уровне 2 сеть отрезана "
+            "и запуск идёт от пользователя, поэтому скрипт самодостаточен: "
+            "входные файлы передавай через параметр inputs.\n")
+
     system_prompt += ("\n\nТвои скилы (название — назначение). "
                       "Когда тема подходит — сначала read_skill(name):\n"
                       + skills_index_text())
@@ -734,7 +785,7 @@ def chat_with_tools(messages, max_rounds=4):
     """
     text = None
     for step in range(1, max_rounds + 1):
-        text, tool_calls = call_hermes(messages, tools=TOOLS)
+        text, tool_calls = call_hermes(messages, tools=active_tools())
         if text is None and not tool_calls:
             return None
         if not tool_calls:

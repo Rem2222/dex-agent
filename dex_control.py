@@ -211,6 +211,7 @@ def api_status():
         "disabled": disabled,
         "tick_count": tick_count,
         "focus": focus,
+        "access_level": state.get("access_level", {}).get("value", 3),
         "drives": drives_raw if isinstance(drives_raw, dict) else {"curiosity": 0.5, "diligence": 0.5},
         "last_tick": ticks[-1] if ticks else None,
         "ticks": ticks,
