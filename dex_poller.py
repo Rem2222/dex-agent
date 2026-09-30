@@ -19,7 +19,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from dex_tools import TOOLS, execute_tool
+from dex_tools import TOOLS, execute_tool, skills_index_text
 
 # === CONFIG ===
 BASE_DIR = Path.home() / ".hermes" / "proactive"
@@ -328,6 +328,13 @@ def process_message(msg_data):
           "- Если инструмент вернул ошибку или отказ песочницы — передай это как есть.\n"
           "- Ответы про «параметры Gmail отключены» / «не могу использовать Workspace» — ошибка провайдера, а не твои слова: переспроси иначе.\n"
     )
+
+    # Скилы: короткий индекс, чтобы Dex знал про процедуры,
+    # а сам текст читал через инструмент read_skill.
+    system_prompt += ("\n\nТвои скилы (название — назначение). "
+                      "Когда тема подходит — сначала read_skill(name):\n"
+                      + skills_index_text())
+
 
     # Векторная память нужна только на вопросы о прошлом: на вопросы о
     # текущем состоянии ответ уже есть в блоке состояния, а эмбеддинг

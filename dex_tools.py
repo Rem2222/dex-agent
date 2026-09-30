@@ -34,6 +34,85 @@ DENY_SUBSTRINGS = (
 MAX_RESULT = 4000
 MAX_LINES = 200
 
+SKILLS_DIR = Path(__file__).resolve().parent / "skills"
+
+
+def _skill_meta(raw, fallback_name):
+    """Минимальный разбор YAML-фронтматтера скила (без PyYAML)."""
+    meta = {"name": fallback_name, "description": "", "when": ""}
+    if not raw.startswith("---"):
+        return meta
+    end = raw.find("\n---", 3)
+    if end == -1:
+        return meta
+    for line in raw[3:end].strip().splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            k, v = k.strip(), v.strip()
+            if k in meta and v:
+                meta[k] = v
+    return meta
+
+
+def _iter_skills():
+    if not SKILLS_DIR.is_dir():
+        return
+    for d in sorted(SKILLS_DIR.iterdir()):
+        f = d / "SKILL.md"
+        if d.is_dir() and f.is_file():
+            yield d.name, f
+
+
+def skills_index_text():
+    """Короткий индекс скилов для system prompt: «- имя — описание»."""
+    rows = []
+    for name, f in _iter_skills():
+        try:
+            meta = _skill_meta(f.read_text(encoding="utf-8"), name)
+        except OSError:
+            continue
+        desc = meta["description"] or "без описания"
+        rows.append(f"- {name} — {desc}")
+    if not rows:
+        return "  (скилов пока нет)"
+    return "\n".join(rows)
+
+
+def tool_list_skills():
+    """Список доступных скилов с описанием и условием применения."""
+    rows = []
+    for name, f in _iter_skills():
+        try:
+            meta = _skill_meta(f.read_text(encoding="utf-8"), name)
+        except OSError:
+            continue
+        line = f"{name}: {meta['description'] or 'без описания'}"
+        if meta["when"]:
+            line += f" | применять: {meta['when']}"
+        rows.append(line)
+    if not rows:
+        return "скилов нет. Создай каталог skills/<имя>/SKILL.md"
+    return f"доступно скилов: {len(rows)}\n" + "\n".join(rows)
+
+
+def tool_read_skill(name):
+    """Отдаёт содержимое скила. Имя — только буквы/дефис, без путей."""
+    name = str(name or "").strip()
+    if not name or not all(c.isalnum() or c in "-_" for c in name):
+        return "недопустимое имя скила: разрешены только буквы, цифры, дефис"
+    f = SKILLS_DIR / name / "SKILL.md"
+    try:
+        resolved = f.resolve()
+    except OSError as e:
+        return f"не удалось разрешить путь: {e}"
+    if not str(resolved).startswith(str(SKILLS_DIR.resolve())):
+        return "отказано песочницей: выход за пределы каталога скилов"
+    if not resolved.is_file():
+        return f"скил '{name}' не найден. Сначала list_skills."
+    return _clip(resolved.read_text(encoding="utf-8", errors="replace"))
+
+
+
 # === СХЕМЫ ДЛЯ ПРОВАЙДЕРА ===
 TOOLS = [
     {
@@ -78,6 +157,22 @@ TOOLS = [
                 "limit": {"type": "integer", "description": "Максимум записей, по умолчанию 60"},
             },
             "required": ["path"],
+        },
+    },
+    {
+        "name": "list_skills",
+        "description": "Список процедур (скилов), которые ты умеешь применять: диагностика сервисов, нехватка места, разбор изменений.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "read_skill",
+        "description": "Прочитать выбранную процедуру целиком — по ней дальше и действовать.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Имя скила из list_skills"}
+            },
+            "required": ["name"],
         },
     },
     {
@@ -210,6 +305,8 @@ DISPATCH = {
     "tail_log": tool_tail_log,
     "read_state": lambda **_: tool_read_state(),
     "run_check": tool_run_check,
+    "list_skills": lambda **_: tool_list_skills(),
+    "read_skill": tool_read_skill,
 }
 
 
