@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 import yaml
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # === CONFIG ===
@@ -39,7 +39,22 @@ NOTIFY_COOLDOWN_SECONDS = {
     # Находки должны доезжать: раньше был дефолт 24ч — за сутки он
     # успевал исследовать 4 раза, а до Рома дошло бы одно.
     "explore_interest": 4 * 3600,
+    # Выход на контакт — чаще отчётов, но всё равно не чаще раза в 6 ч
+    "outreach": 6 * 3600,
 }
+
+# Инициативные сообщения ночью не шлём: разбудят. Пишутся, но не
+# отправляются до утра (mark_notified не ставится — уйдёт после 08:00).
+QUIET_ACTIONS = {"outreach", "explore_interest"}
+QUIET_FROM, QUIET_TO = 0, 8   # часы по Ростову (UTC+3)
+
+
+def _quiet_hours(action):
+    """True, если для этого действия сейчас ночное окно."""
+    if action not in QUIET_ACTIONS:
+        return False
+    hour = datetime.now(timezone(timedelta(hours=3))).hour
+    return QUIET_FROM <= hour < QUIET_TO
 DIGEST_INTERVAL_SECONDS = 24 * 3600
 DIGEST_MAX_ENTRIES = 12
 
@@ -313,7 +328,13 @@ def task_add(db, what, source="heartbeat", result=None):
         (what, "pending", source, result,
          datetime.now(timezone.utc).isoformat()))
     db.commit()
-    return int(cur.lastrowid)
+    tid = int(cur.lastrowid)
+    # Ром об этом не узнает иначе: раньше задачи жили в БД в тишине
+    try:
+        send_telegram(f"📋 Новая задача <b>#{tid}</b>: {what}")
+    except Exception as e:
+        log(f"уведомление о задаче не ушло: {e}")
+    return tid
 
 
 def task_list(db, status="pending", limit=20):
@@ -466,6 +487,11 @@ def main():
             "выбери одну из обязанностей в списке «Пора проверить».")
     if duty_due:
         prompt_parts.append(f"Пора проверить: {', '.join(duty_due)}")
+    if "outreach" in available:
+        prompt_parts.append(
+            "Есть материал для Рома (открытая задача или свежая находка) — "
+            "можно выйти на контакт, выбери outreach. Если полезного нечего "
+            "сказать — выбери none.")
     # Открытые задачи: влияют и на выбор, и на исполнительность.
     # Просрочка старше суток копит драйв — потребность не насыщена.
     tstats = task_stats(db)
@@ -486,6 +512,9 @@ def main():
     # Что реально можно выбрать в ЭТОМ тике: привычка/исследование всегда,
     # обязанности — только те, что подошли по интервалу.
     available = ["none", "explore_interest"] + list(duty_due)
+    # Выход на контакт — только когда накоплен интерес И есть материал
+    if drives.get("curiosity", 0) >= 0.6 and _outreach_material(db):
+        available.append("outreach")
     prompt_parts.append(
         "Что делаем в этом тике? Ответь ТОЛЬКО одним словом — одним из: "
         + ", ".join(available)
@@ -514,7 +543,7 @@ def main():
 
     # Берём только первое слово ответа
     decision = decision.strip().lower().split()[0] if decision.strip() else "none"
-    valid_choices = {"check_updates", "check_backups", "check_disk", "check_tools", "check_services", "explore_interest", "none"}
+    valid_choices = {"check_updates", "check_backups", "check_disk", "check_tools", "check_services", "explore_interest", "outreach", "none"}
     if decision not in valid_choices:
         log(f"Dex ответил невалидным ключом: {decision}, пропускаю тик")
         set_state(db, "current_focus", "nothing")
@@ -552,11 +581,26 @@ def main():
         result = execute_check_services()
     elif decision == "explore_interest":
         result = execute_explore_interest(identity, db)
+    elif decision == "outreach":
+        result = execute_outreach(db)
     else:
         result = f"неизвестная команда: {decision}"
 
     # Замеченное, но неисправимое — в задачи (дедуп по тексту)
     maybe_file_task(db, decision, result)
+
+    if decision == "outreach" and not str(result or "").strip():
+        # Материал иссяк или LLM решил нечего говорить — молчим,
+        # тик идёт в простой и interest растёт дальше.
+        log("outreach: полезного нечего сказать — пропускаю")
+        set_state(db, "current_focus", "nothing")
+        drives["curiosity"] = round(min(DRIVE_CEIL,
+                                        drives.get("curiosity", 0.5) + DRIVE_STEP_IDLE), 2)
+        set_state(db, "drives", drives)
+        write_tick({"tick": tick_num, "action": "none",
+                    "result": "outreach: нечего сказать",
+                    "ts": datetime.now(timezone.utc).isoformat()})
+        return
 
     # Отметили выполнение обязанности — БЕЗ ЭТОГО check_duty считает
     # last_check = 0 и каждый тик возвращает все пять, то есть
@@ -573,7 +617,7 @@ def main():
     if decision in DUTY_KEYS:
         drives["diligence"] = round(max(DRIVE_FLOOR,
                                         drives.get("diligence", 0.5) - DRIVE_SAT_DILIGENCE), 2)
-    if decision == "explore_interest":
+    if decision in ("explore_interest", "outreach"):
         drives["curiosity"] = round(max(DRIVE_FLOOR,
                                         drives.get("curiosity", 0.5) - DRIVE_SAT_CURIOSITY), 2)
     elif decision not in DUTY_KEYS:
@@ -592,10 +636,18 @@ def main():
     anomaly = format_notification(decision, result)
     icon = {"check_disk": "💾", "check_backups": "💿", "check_updates": "🔄",
             "check_services": "🔍", "check_tools": "🔧",
-            "explore_interest": "🧠"}.get(decision, "▫️")
-    notify = anomaly or f"{icon} <b>{decision}</b>: {result}"
+            "explore_interest": "🧠", "outreach": "💬"}.get(decision, "▫️")
+    if decision == "outreach":
+        # outreach — уже готовое обращение, шапка «check_x:» его убьёт
+        notify = result
+    else:
+        notify = anomaly or f"{icon} <b>{decision}</b>: {result}"
 
-    if should_notify(db, decision, notify):
+    if _quiet_hours(decision):
+        # Не шлём и НЕ отмечаем — уйдёт после 08:00, кулдаун считается
+        # от последней реально отправленной копии.
+        log(f"тихие часы (МСК {datetime.now(timezone(timedelta(hours=3))):%H:%M}) — {decision} не отправляю")
+    elif should_notify(db, decision, notify):
         if send_telegram(notify):
             mark_notified(db, decision, notify)
             log(f"Telegram: отчёт по {decision} отправлен")
@@ -695,7 +747,16 @@ def execute_check_backups():
     backup_dir = Path("/root/backups")
     if not backup_dir.exists():
         return "директория бэкапов не найдена"
-    files = list(backup_dir.glob("*.sql.gz")) + list(backup_dir.glob("*.tar.gz"))
+    # Глобы должны видеть и .enc (шифрованные), и .tgz — иначе после
+    # шифрования ночного прогона проверка врала «нет файлов бэкапов»
+    # и заводила ложную задачу (случай 30.09, 21:30 UTC).
+    files = []
+    for f in backup_dir.iterdir():
+        if not f.is_file():
+            continue
+        name = f.name[:-4] if f.name.endswith(".enc") else f.name
+        if name.endswith((".sql.gz", ".tar.gz", ".tgz")):
+            files.append(f)
     if not files:
         return "нет файлов бэкапов"
     newest = max(files, key=lambda f: f.stat().st_mtime)
@@ -1004,6 +1065,63 @@ def execute_explore_interest(identity, db):
     set_state(db, "last_explored_interest", last)
 
     return f"{interest}: {note[:700]}"
+
+
+def _outreach_material(db):
+    """Есть ли что сказать: открытая задача или свежая находка (<24 ч)."""
+    try:
+        if task_stats(db)["pending"]:
+            return True
+    except Exception:
+        pass
+    exp = get_state(db, "explorations", [])
+    if not isinstance(exp, list) or not exp:
+        return False
+    try:
+        ts = exp[-1].get("ts", "")
+        age = datetime.now(timezone.utc) - datetime.fromisoformat(ts)
+        return age.total_seconds() < 24 * 3600
+    except Exception:
+        return True
+
+
+def execute_outreach(db):
+    """Выход на контакт: ОДНО сообщение от первого лица, только по фактам.
+
+    Если полезного нечего сказать — возвращает пустую строку, и тик
+    уходит в простой (никакой генерации пустоты).
+    """
+    facts = []
+    for r in task_list(db, "pending", 5):
+        facts.append(f"открытая задача #{r['id']} ({str(r.get('created_at'))[:16]}): "
+                     f"{r.get('what')}")
+    exp = get_state(db, "explorations", [])
+    if isinstance(exp, list) and exp:
+        e = exp[-1]
+        facts.append(f"последнее исследование — {e.get('interest')}: {e.get('note')}")
+    hist = read_tick_history(2)
+    for t in hist:
+        facts.append(f"тик: {t.get('action')} → {t.get('result')}")
+    if not facts:
+        return ""
+
+    prompt = (
+        "Напиши ОДНО короткое сообщение Рому — владельцу сервера — от первого лица.\n"
+        "Требования: без шапки и без HTML-разметки, без списка эмодзи, "
+        "1–2 предложения, строго по фактам ниже, живо, но без воды и без лести. "
+        "Это не отчёт, а обращение: скажи то, что стоит знать именно сейчас.\n"
+        "Если по этим фактам полезного сказать нечего — ответь одним словом: NONE\n\n"
+        "Факты:\n" + "\n".join("- " + f for f in facts))
+    txt = call_llm(
+        "Ты — Dex, смотритель сервера. Пишешь Рому короткие сообщения "
+        "по-русски, по делу, без разметки и без лести.",
+        prompt, max_tokens=200, db=db)
+    if not txt:
+        return ""
+    txt = str(txt).strip()
+    if txt.upper().startswith("NONE") or len(txt) < 15:
+        return ""
+    return " ".join(txt.split())[:400]
 
 
 if __name__ == "__main__":
