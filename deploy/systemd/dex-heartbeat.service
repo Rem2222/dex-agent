@@ -1,0 +1,12 @@
+[Unit]
+Description=Dex heartbeat tick (runs dex-tick.sh once)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/.hermes/proactive
+ExecStart=/bin/bash /root/.hermes/proactive/dex-tick.sh
+StandardOutput=journal
+StandardError=journal

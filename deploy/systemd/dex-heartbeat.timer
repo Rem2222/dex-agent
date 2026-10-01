@@ -1,0 +1,11 @@
+[Unit]
+Description=Timer for Dex heartbeat tick (every 10 min)
+
+[Timer]
+OnBootSec=2min
+OnCalendar=*:0/10
+Persistent=true
+Unit=dex-heartbeat.service
+
+[Install]
+WantedBy=timers.target

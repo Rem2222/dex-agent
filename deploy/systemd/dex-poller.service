@@ -1,0 +1,18 @@
+[Unit]
+Description=Dex Telegram poller
+After=network-online.target dex-control.service
+Wants=network-online.target
+Requires=dex-control.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/.hermes/proactive
+ExecStart=/usr/bin/python3 /root/.hermes/proactive/dex_poller.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

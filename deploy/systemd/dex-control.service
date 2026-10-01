@@ -1,0 +1,17 @@
+[Unit]
+Description=Dex control panel (HTTP API, port 3333)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/.hermes/proactive
+ExecStart=/root/.hermes/proactive/venv/bin/python3 /root/.hermes/proactive/dex_control.py --port 3333 --host 127.0.0.1
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Dex watchdog (alert if no tick for 30+ min)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/bin/bash /root/.hermes/proactive/dex-watchdog.sh
+StandardOutput=journal
+StandardError=journal
