@@ -976,9 +976,19 @@ def save_message(chat_id, msg):
 # === MAIN LOOP ===
 def main():
     if DISABLED_FLAG.exists():
-        log("Dex спит (DISABLED)")
-        time.sleep(60)
-        return
+        # Раньше здесь был time.sleep(60) + return: процесс выходил, а юнит с
+        # Restart=always поднимал его снова — бесконечный цикл рестартов каждые
+        # ~65 секунд (к 03.11.2026 счётчик дошёл до 12975). Теперь ждём снятия
+        # флага ВНУТРИ процесса: рестартов нет, и включение Dex подхватывается
+        # сразу, без ручного запуска юнита.
+        log("Dex спит (DISABLED) — жду снятия флага, процесс не выходит")
+        waited = 0
+        while DISABLED_FLAG.exists():
+            time.sleep(60)
+            waited += 60
+            if waited % 300 == 0:
+                log(f"Dex всё ещё спит (DISABLED), ждём {waited // 60} мин")
+        log("Флаг DISABLED снят — стартую")
 
     if not load_token():
         time.sleep(30)
